@@ -17,13 +17,11 @@ limitations under the License.
 package committer
 
 import (
-	"fmt"
-
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/committer/txvalidator"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/events/producer"
 	"github.com/hyperledger/fabric/protos/common"
-	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/op/go-logging"
 )
 
@@ -35,7 +33,7 @@ import (
 var logger *logging.Logger // package-level logger
 
 func init() {
-	logger = logging.MustGetLogger("committer")
+	logger = flogging.MustGetLogger("committer")
 }
 
 // LedgerCommitter is the implementation of  Committer interface
@@ -66,8 +64,7 @@ func (lc *LedgerCommitter) Commit(block *common.Block) error {
 
 	// send block event *after* the block has been committed
 	if err := producer.SendProducerBlockEvent(block); err != nil {
-		logger.Errorf("Error sending block event %s", err)
-		return fmt.Errorf("Error sending block event %s", err)
+		logger.Errorf("Error publishing block %d, because: %v", block.Header.Number, err)
 	}
 
 	return nil
@@ -75,7 +72,7 @@ func (lc *LedgerCommitter) Commit(block *common.Block) error {
 
 // LedgerHeight returns recently committed block sequence number
 func (lc *LedgerCommitter) LedgerHeight() (uint64, error) {
-	var info *pb.BlockchainInfo
+	var info *common.BlockchainInfo
 	var err error
 	if info, err = lc.ledger.GetBlockchainInfo(); err != nil {
 		logger.Errorf("Cannot get blockchain info, %s\n", info)

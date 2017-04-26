@@ -27,7 +27,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/bccsp/signer"
-	"github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric/protos/msp"
 	"github.com/op/go-logging"
 )
 
@@ -46,12 +46,12 @@ type identity struct {
 }
 
 func newIdentity(id *IdentityIdentifier, cert *x509.Certificate, pk bccsp.Key, msp *bccspmsp) Identity {
-	mspLogger.Infof("Creating identity instance for ID %s", id)
+	mspLogger.Debugf("Creating identity instance for ID %s", id)
 	return &identity{id: id, cert: cert, pk: pk, msp: msp}
 }
 
 // SatisfiesPrincipal returns null if this instance matches the supplied principal or an error otherwise
-func (id *identity) SatisfiesPrincipal(principal *common.MSPPrincipal) error {
+func (id *identity) SatisfiesPrincipal(principal *msp.MSPPrincipal) error {
 	return id.msp.SatisfiesPrincipal(id, principal)
 }
 
@@ -70,10 +70,28 @@ func (id *identity) Validate() error {
 	return id.msp.Validate(id)
 }
 
-// GetOrganizationUnits returns the OU for this instance
-func (id *identity) GetOrganizationUnits() string {
-	// TODO
-	return "dunno"
+// GetOrganizationalUnits returns the OU for this instance
+func (id *identity) GetOrganizationalUnits() []msp.FabricOUIdentifier {
+	if id.cert == nil {
+		return nil
+	}
+
+	cid, err := id.msp.getCertificationChainIdentifier(id)
+	if err != nil {
+		mspLogger.Errorf("Failed getting certification chain identifier for [%v]: [%s]", id, err)
+
+		return nil
+	}
+
+	res := []msp.FabricOUIdentifier{}
+	for _, unit := range id.cert.Subject.OrganizationalUnit {
+		res = append(res, msp.FabricOUIdentifier{
+			OrganizationalUnitIdentifier: unit,
+			CertifiersIdentifier:         cid,
+		})
+	}
+
+	return res
 }
 
 // NewSerializedIdentity returns a serialized identity
@@ -83,7 +101,7 @@ func (id *identity) GetOrganizationUnits() string {
 func NewSerializedIdentity(mspID string, certPEM []byte) ([]byte, error) {
 	// We serialize identities by prepending the MSPID
 	// and appending the x509 cert in PEM format
-	sId := &SerializedIdentity{Mspid: mspID, IdBytes: certPEM}
+	sId := &msp.SerializedIdentity{Mspid: mspID, IdBytes: certPEM}
 	raw, err := proto.Marshal(sId)
 	if err != nil {
 		return nil, fmt.Errorf("Failed serializing identity [%s][% X]: [%s]", mspID, certPEM, err)
@@ -98,7 +116,12 @@ func (id *identity) Verify(msg []byte, sig []byte) error {
 	// mspLogger.Infof("Verifying signature")
 
 	// Compute Hash
-	digest, err := id.msp.bccsp.Hash(msg, &bccsp.SHAOpts{})
+	hashOpt, err := id.getHashOpt(id.msp.cryptoConfig.SignatureHashFamily)
+	if err != nil {
+		return fmt.Errorf("Failed getting hash function options [%s]", err)
+	}
+
+	digest, err := id.msp.bccsp.Hash(msg, hashOpt)
 	if err != nil {
 		return fmt.Errorf("Failed computing digest [%s]", err)
 	}
@@ -140,13 +163,23 @@ func (id *identity) Serialize() ([]byte, error) {
 	}
 
 	// We serialize identities by prepending the MSPID and appending the ASN.1 DER content of the cert
-	sId := &SerializedIdentity{Mspid: id.id.Mspid, IdBytes: pemBytes}
+	sId := &msp.SerializedIdentity{Mspid: id.id.Mspid, IdBytes: pemBytes}
 	idBytes, err := proto.Marshal(sId)
 	if err != nil {
 		return nil, fmt.Errorf("Could not marshal a SerializedIdentity structure for identity %s, err %s", id.id, err)
 	}
 
 	return idBytes, nil
+}
+
+func (id *identity) getHashOpt(hashFamily string) (bccsp.HashOpts, error) {
+	switch hashFamily {
+	case bccsp.SHA2:
+		return bccsp.GetHashOpt(bccsp.SHA256)
+	case bccsp.SHA3:
+		return bccsp.GetHashOpt(bccsp.SHA3_256)
+	}
+	return nil, fmt.Errorf("hash famility not recognized [%s]", hashFamily)
 }
 
 type signingidentity struct {
@@ -167,7 +200,12 @@ func (id *signingidentity) Sign(msg []byte) ([]byte, error) {
 	//mspLogger.Infof("Signing message")
 
 	// Compute Hash
-	digest, err := id.msp.bccsp.Hash(msg, &bccsp.SHAOpts{})
+	hashOpt, err := id.getHashOpt(id.msp.cryptoConfig.SignatureHashFamily)
+	if err != nil {
+		return nil, fmt.Errorf("Failed getting hash function options [%s]", err)
+	}
+
+	digest, err := id.msp.bccsp.Hash(msg, hashOpt)
 	if err != nil {
 		return nil, fmt.Errorf("Failed computing digest [%s]", err)
 	}

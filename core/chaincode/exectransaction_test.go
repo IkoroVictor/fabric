@@ -18,45 +18,49 @@ package chaincode
 
 import (
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"path/filepath"
+	"encoding/json"
+	"strings"
 
+	"github.com/golang/protobuf/proto"
+
+	mockpolicies "github.com/hyperledger/fabric/common/mocks/policies"
+	"github.com/hyperledger/fabric/common/policies"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/core/common/ccprovider"
+	"github.com/hyperledger/fabric/core/config"
 	"github.com/hyperledger/fabric/core/container"
 	"github.com/hyperledger/fabric/core/container/ccintf"
 	"github.com/hyperledger/fabric/core/ledger"
+	"github.com/hyperledger/fabric/core/ledger/util/couchdb"
 	"github.com/hyperledger/fabric/core/peer"
+	"github.com/hyperledger/fabric/core/policy"
 	"github.com/hyperledger/fabric/core/scc"
 	pb "github.com/hyperledger/fabric/protos/peer"
 	putils "github.com/hyperledger/fabric/protos/utils"
 
-	"github.com/golang/protobuf/proto"
+	"bytes"
+
 	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
 	"github.com/hyperledger/fabric/core/ledger/ledgermgmt"
 	"github.com/hyperledger/fabric/msp"
 	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
+	"github.com/hyperledger/fabric/msp/mgmt/testtools"
 	"github.com/hyperledger/fabric/protos/common"
 	"github.com/spf13/viper"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
-
-// attributes to request in the batch of tcerts while deploying, invoking
-var attributes = []string{"company", "position"}
-
-func getNowMillis() int64 {
-	nanos := time.Now().UnixNano()
-	return nanos / 1000000
-}
 
 //initialize peer and start up. If security==enabled, login as vp
 func initPeer(chainIDs ...string) (net.Listener, error) {
@@ -67,7 +71,7 @@ func initPeer(chainIDs ...string) (net.Listener, error) {
 
 	var opts []grpc.ServerOption
 	if viper.GetBool("peer.tls.enabled") {
-		creds, err := credentials.NewServerTLSFromFile(viper.GetString("peer.tls.cert.file"), viper.GetString("peer.tls.key.file"))
+		creds, err := credentials.NewServerTLSFromFile(config.GetPath("peer.tls.cert.file"), config.GetPath("peer.tls.key.file"))
 		if err != nil {
 			return nil, fmt.Errorf("Failed to generate credentials %v", err)
 		}
@@ -85,11 +89,14 @@ func initPeer(chainIDs ...string) (net.Listener, error) {
 	}
 
 	getPeerEndpoint := func() (*pb.PeerEndpoint, error) {
-		return &pb.PeerEndpoint{ID: &pb.PeerID{Name: "testpeer"}, Address: peerAddress}, nil
+		return &pb.PeerEndpoint{Id: &pb.PeerID{Name: "testpeer"}, Address: peerAddress}, nil
 	}
 
 	ccStartupTimeout := time.Duration(chaincodeStartupTimeoutDefault) * time.Millisecond
 	pb.RegisterChaincodeSupportServer(grpcServer, NewChaincodeSupport(getPeerEndpoint, false, ccStartupTimeout))
+
+	// Mock policy checker
+	policy.RegisterPolicyCheckerFactory(&mockPolicyCheckerFactory{})
 
 	scc.RegisterSysCCs()
 
@@ -118,9 +125,28 @@ func finitPeer(lis net.Listener, chainIDs ...string) {
 		closeListenerAndSleep(lis)
 	}
 	ledgermgmt.CleanupTestEnv()
-	ledgerPath := viper.GetString("peer.fileSystemPath")
+	ledgerPath := config.GetPath("peer.fileSystemPath")
 	os.RemoveAll(ledgerPath)
 	os.RemoveAll(filepath.Join(os.TempDir(), "hyperledger"))
+
+	//if couchdb is enabled, then cleanup the test couchdb
+	if ledgerconfig.IsCouchDBEnabled() == true {
+
+		chainID := util.GetTestChainID()
+
+		connectURL := viper.GetString("ledger.state.couchDBConfig.couchDBAddress")
+		username := viper.GetString("ledger.state.couchDBConfig.username")
+		password := viper.GetString("ledger.state.couchDBConfig.password")
+		maxRetries := viper.GetInt("ledger.state.couchDBConfig.maxRetries")
+		maxRetriesOnStartup := viper.GetInt("ledger.state.couchDBConfig.maxRetriesOnStartup")
+		requestTimeout := viper.GetDuration("ledger.state.couchDBConfig.requestTimeout")
+
+		couchInstance, _ := couchdb.CreateCouchInstance(connectURL, username, password, maxRetries, maxRetriesOnStartup, requestTimeout)
+		db := couchdb.CouchDatabase{CouchInstance: *couchInstance, DBName: chainID}
+		//drop the test database
+		db.DropDatabase()
+
+	}
 }
 
 func startTxSimulation(ctxt context.Context, chainID string) (context.Context, ledger.TxSimulator, error) {
@@ -129,39 +155,44 @@ func startTxSimulation(ctxt context.Context, chainID string) (context.Context, l
 	if err != nil {
 		return nil, nil, err
 	}
+	historyQueryExecutor, err := lgr.NewHistoryQueryExecutor()
+	if err != nil {
+		return nil, nil, err
+	}
 
 	ctxt = context.WithValue(ctxt, TXSimulatorKey, txsim)
+	ctxt = context.WithValue(ctxt, HistoryQueryExecutorKey, historyQueryExecutor)
 	return ctxt, txsim, nil
 }
 
-func endTxSimulationCDS(chainID string, txid string, txsim ledger.TxSimulator, payload []byte, commit bool, cds *pb.ChaincodeDeploymentSpec) error {
+func endTxSimulationCDS(chainID string, _ string, txsim ledger.TxSimulator, payload []byte, commit bool, cds *pb.ChaincodeDeploymentSpec, blockNumber uint64) error {
 	// get serialized version of the signer
 	ss, err := signer.Serialize()
 	if err != nil {
 		return err
 	}
 	// get a proposal - we need it to get a transaction
-	prop, err := putils.CreateDeployProposalFromCDS(txid, chainID, cds, ss, nil, nil, nil)
+	prop, _, err := putils.CreateDeployProposalFromCDS(chainID, cds, ss, nil, nil, nil)
 	if err != nil {
 		return err
 	}
 
-	return endTxSimulation(chainID, txsim, payload, commit, prop)
+	return endTxSimulation(chainID, txsim, payload, commit, prop, blockNumber)
 }
 
-func endTxSimulationCIS(chainID string, txid string, txsim ledger.TxSimulator, payload []byte, commit bool, cis *pb.ChaincodeInvocationSpec) error {
+func endTxSimulationCIS(chainID string, _ string, txsim ledger.TxSimulator, payload []byte, commit bool, cis *pb.ChaincodeInvocationSpec, blockNumber uint64) error {
 	// get serialized version of the signer
 	ss, err := signer.Serialize()
 	if err != nil {
 		return err
 	}
 	// get a proposal - we need it to get a transaction
-	prop, err := putils.CreateProposalFromCIS(txid, common.HeaderType_ENDORSER_TRANSACTION, chainID, cis, ss)
+	prop, _, err := putils.CreateProposalFromCIS(common.HeaderType_ENDORSER_TRANSACTION, chainID, cis, ss)
 	if err != nil {
 		return err
 	}
 
-	return endTxSimulation(chainID, txsim, payload, commit, prop)
+	return endTxSimulation(chainID, txsim, payload, commit, prop, blockNumber)
 }
 
 //getting a crash from ledger.Commit when doing concurrent invokes
@@ -174,7 +205,7 @@ func endTxSimulationCIS(chainID string, txid string, txsim ledger.TxSimulator, p
 //concurrently (100 concurrent invokes followed by 100 concurrent queries)
 var _commitLock_ sync.Mutex
 
-func endTxSimulation(chainID string, txsim ledger.TxSimulator, payload []byte, commit bool, prop *pb.Proposal) error {
+func endTxSimulation(chainID string, txsim ledger.TxSimulator, _ []byte, commit bool, prop *pb.Proposal, blockNumber uint64) error {
 	txsim.Done()
 	if lgr := peer.GetLedger(chainID); lgr != nil {
 		if commit {
@@ -204,7 +235,7 @@ func endTxSimulation(chainID string, txsim ledger.TxSimulator, payload []byte, c
 			}
 
 			//create the block with 1 transaction
-			block := common.NewBlock(1, []byte{})
+			block := common.NewBlock(blockNumber, []byte{})
 			block.Data.Data = [][]byte{envBytes}
 			//commit the block
 
@@ -221,44 +252,46 @@ func endTxSimulation(chainID string, txsim ledger.TxSimulator, payload []byte, c
 }
 
 // Build a chaincode.
-func getDeploymentSpec(context context.Context, spec *pb.ChaincodeSpec) (*pb.ChaincodeDeploymentSpec, error) {
+func getDeploymentSpec(_ context.Context, spec *pb.ChaincodeSpec) (*pb.ChaincodeDeploymentSpec, error) {
 	fmt.Printf("getting deployment spec for chaincode spec: %v\n", spec)
 	codePackageBytes, err := container.GetChaincodePackageBytes(spec)
 	if err != nil {
 		return nil, err
 	}
-	chaincodeDeploymentSpec := &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec, CodePackage: codePackageBytes}
-	return chaincodeDeploymentSpec, nil
+	cdDeploymentSpec := &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec, CodePackage: codePackageBytes}
+	return cdDeploymentSpec, nil
 }
 
-//getDeployLCCCSpec gets the spec for the chaincode deployment to be sent to LCCC
-func getDeployLCCCSpec(chainID string, cds *pb.ChaincodeDeploymentSpec) (*pb.ChaincodeInvocationSpec, error) {
+//getDeployLSCCSpec gets the spec for the chaincode deployment to be sent to LSCC
+func getDeployLSCCSpec(chainID string, cds *pb.ChaincodeDeploymentSpec) (*pb.ChaincodeInvocationSpec, error) {
 	b, err := proto.Marshal(cds)
 	if err != nil {
 		return nil, err
 	}
 
-	//wrap the deployment in an invocation spec to lccc...
-	lcccSpec := &pb.ChaincodeInvocationSpec{ChaincodeSpec: &pb.ChaincodeSpec{Type: pb.ChaincodeSpec_GOLANG, ChaincodeID: &pb.ChaincodeID{Name: "lccc"}, Input: &pb.ChaincodeInput{Args: [][]byte{[]byte("deploy"), []byte(chainID), b}}}}
+	sysCCVers := util.GetSysCCVersion()
 
-	return lcccSpec, nil
+	//wrap the deployment in an invocation spec to lscc...
+	lsccSpec := &pb.ChaincodeInvocationSpec{ChaincodeSpec: &pb.ChaincodeSpec{Type: pb.ChaincodeSpec_GOLANG, ChaincodeId: &pb.ChaincodeID{Name: "lscc", Version: sysCCVers}, Input: &pb.ChaincodeInput{Args: [][]byte{[]byte("deploy"), []byte(chainID), b}}}}
+
+	return lsccSpec, nil
 }
 
 // Deploy a chaincode - i.e., build and initialize.
-func deploy(ctx context.Context, cccid *ccprovider.CCContext, spec *pb.ChaincodeSpec) (b []byte, err error) {
+func deploy(ctx context.Context, cccid *ccprovider.CCContext, spec *pb.ChaincodeSpec, blockNumber uint64) (b []byte, err error) {
 	// First build and get the deployment spec
-	chaincodeDeploymentSpec, err := getDeploymentSpec(ctx, spec)
+	cdDeploymentSpec, err := getDeploymentSpec(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
 
-	return deploy2(ctx, cccid, chaincodeDeploymentSpec)
+	return deploy2(ctx, cccid, cdDeploymentSpec, blockNumber)
 }
 
-func deploy2(ctx context.Context, cccid *ccprovider.CCContext, chaincodeDeploymentSpec *pb.ChaincodeDeploymentSpec) (b []byte, err error) {
-	cis, err := getDeployLCCCSpec(cccid.ChainID, chaincodeDeploymentSpec)
+func deploy2(ctx context.Context, cccid *ccprovider.CCContext, chaincodeDeploymentSpec *pb.ChaincodeDeploymentSpec, blockNumber uint64) (b []byte, err error) {
+	cis, err := getDeployLSCCSpec(cccid.ChainID, chaincodeDeploymentSpec)
 	if err != nil {
-		return nil, fmt.Errorf("Error creating lccc spec : %s\n", err)
+		return nil, fmt.Errorf("Error creating lscc spec : %s\n", err)
 	}
 
 	ctx, txsim, err := startTxSimulation(ctx, cccid.ChainID)
@@ -274,36 +307,40 @@ func deploy2(ctx context.Context, cccid *ccprovider.CCContext, chaincodeDeployme
 		//no error, lets try commit
 		if err == nil {
 			//capture returned error from commit
-			err = endTxSimulationCDS(cccid.ChainID, uuid, txsim, []byte("deployed"), true, chaincodeDeploymentSpec)
+			err = endTxSimulationCDS(cccid.ChainID, uuid, txsim, []byte("deployed"), true, chaincodeDeploymentSpec, blockNumber)
 		} else {
 			//there was an error, just close simulation and return that
-			endTxSimulationCDS(cccid.ChainID, uuid, txsim, []byte("deployed"), false, chaincodeDeploymentSpec)
+			endTxSimulationCDS(cccid.ChainID, uuid, txsim, []byte("deployed"), false, chaincodeDeploymentSpec, blockNumber)
 		}
 	}()
 
-	sysCCVers := util.GetSysCCVersion()
-	lcccid := ccprovider.NewCCContext(cccid.ChainID, cis.ChaincodeSpec.ChaincodeID.Name, sysCCVers, uuid, true, nil)
+	//ignore existence errors
+	ccprovider.PutChaincodeIntoFS(chaincodeDeploymentSpec)
 
-	//write to lccc
-	if _, _, err = ExecuteWithErrorFilter(ctx, lcccid, cis); err != nil {
-		return nil, fmt.Errorf("Error deploying chaincode: %s", err)
+	sysCCVers := util.GetSysCCVersion()
+	sprop, prop := putils.MockSignedEndorserProposalOrPanic(cccid.ChainID, cis.ChaincodeSpec, []byte("Admin"), []byte("msg1"))
+	lsccid := ccprovider.NewCCContext(cccid.ChainID, cis.ChaincodeSpec.ChaincodeId.Name, sysCCVers, uuid, true, sprop, prop)
+
+	//write to lscc
+	if _, _, err = ExecuteWithErrorFilter(ctx, lsccid, cis); err != nil {
+		return nil, fmt.Errorf("Error deploying chaincode (1): %s", err)
 	}
 
 	if b, _, err = ExecuteWithErrorFilter(ctx, cccid, chaincodeDeploymentSpec); err != nil {
-		return nil, fmt.Errorf("Error deploying chaincode: %s", err)
+		return nil, fmt.Errorf("Error deploying chaincode(2): %s", err)
 	}
 
 	return b, nil
 }
 
 // Invoke a chaincode.
-func invoke(ctx context.Context, chainID string, spec *pb.ChaincodeSpec) (ccevt *pb.ChaincodeEvent, uuid string, retval []byte, err error) {
-	return invokeWithVersion(ctx, chainID, "0", spec)
+func invoke(ctx context.Context, chainID string, spec *pb.ChaincodeSpec, blockNumber uint64, creator []byte) (ccevt *pb.ChaincodeEvent, uuid string, retval []byte, err error) {
+	return invokeWithVersion(ctx, chainID, spec.GetChaincodeId().Version, spec, blockNumber, creator)
 }
 
 // Invoke a chaincode with version (needed for upgrade)
-func invokeWithVersion(ctx context.Context, chainID string, version string, spec *pb.ChaincodeSpec) (ccevt *pb.ChaincodeEvent, uuid string, retval []byte, err error) {
-	chaincodeInvocationSpec := &pb.ChaincodeInvocationSpec{ChaincodeSpec: spec}
+func invokeWithVersion(ctx context.Context, chainID string, version string, spec *pb.ChaincodeSpec, blockNumber uint64, creator []byte) (ccevt *pb.ChaincodeEvent, uuid string, retval []byte, err error) {
+	cdInvocationSpec := &pb.ChaincodeInvocationSpec{ChaincodeSpec: spec}
 
 	// Now create the Transactions message and send to Peer.
 	uuid = util.GenerateUUID()
@@ -318,15 +355,19 @@ func invokeWithVersion(ctx context.Context, chainID string, version string, spec
 		//no error, lets try commit
 		if err == nil {
 			//capture returned error from commit
-			err = endTxSimulationCIS(chainID, uuid, txsim, []byte("invoke"), true, chaincodeInvocationSpec)
+			err = endTxSimulationCIS(chainID, uuid, txsim, []byte("invoke"), true, cdInvocationSpec, blockNumber)
 		} else {
 			//there was an error, just close simulation and return that
-			endTxSimulationCIS(chainID, uuid, txsim, []byte("invoke"), false, chaincodeInvocationSpec)
+			endTxSimulationCIS(chainID, uuid, txsim, []byte("invoke"), false, cdInvocationSpec, blockNumber)
 		}
 	}()
 
-	cccid := ccprovider.NewCCContext(chainID, chaincodeInvocationSpec.ChaincodeSpec.ChaincodeID.Name, version, uuid, false, nil)
-	retval, ccevt, err = ExecuteWithErrorFilter(ctx, cccid, chaincodeInvocationSpec)
+	if len(creator) == 0 {
+		creator = []byte("Admin")
+	}
+	sprop, prop := putils.MockSignedEndorserProposalOrPanic(chainID, spec, creator, []byte("msg1"))
+	cccid := ccprovider.NewCCContext(chainID, cdInvocationSpec.ChaincodeSpec.ChaincodeId.Name, version, uuid, false, sprop, prop)
+	retval, ccevt, err = ExecuteWithErrorFilter(ctx, cccid, cdInvocationSpec)
 	if err != nil {
 		return nil, uuid, nil, fmt.Errorf("Error invoking chaincode: %s", err)
 	}
@@ -354,43 +395,47 @@ func executeDeployTransaction(t *testing.T, chainID string, name string, url str
 
 	f := "init"
 	args := util.ToChaincodeArgs(f, "a", "100", "b", "200")
-	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeID: &pb.ChaincodeID{Name: name, Path: url}, Input: &pb.ChaincodeInput{Args: args}}
+	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeId: &pb.ChaincodeID{Name: name, Path: url, Version: "0"}, Input: &pb.ChaincodeInput{Args: args}}
 
-	cccid := ccprovider.NewCCContext(chainID, name, "0", "", false, nil)
+	cccid := ccprovider.NewCCContext(chainID, name, "0", "", false, nil, nil)
 
-	_, err = deploy(ctxt, cccid, spec)
+	_, err = deploy(ctxt, cccid, spec, 0)
 
-	chaincodeID := spec.ChaincodeID.Name
+	cID := spec.ChaincodeId.Name
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
 		t.Fail()
-		t.Logf("Error deploying <%s>: %s", chaincodeID, err)
+		t.Logf("Error deploying <%s>: %s", cID, err)
 		return
 	}
 
 	theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
 }
 
-func chaincodeQueryChaincode(chainID string, user string) error {
+// chaincodeQueryChaincode function
+func _(chainID string, _ string) error {
 	var ctxt = context.Background()
 
 	// Deploy first chaincode
 	url1 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02"
 
-	cID1 := &pb.ChaincodeID{Name: "example02", Path: url1}
+	cID1 := &pb.ChaincodeID{Name: "example02", Path: url1, Version: "0"}
 	f := "init"
 	args := util.ToChaincodeArgs(f, "a", "100", "b", "200")
 
-	spec1 := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID1, Input: &pb.ChaincodeInput{Args: args}}
+	spec1 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID1, Input: &pb.ChaincodeInput{Args: args}}
 
-	cccid1 := ccprovider.NewCCContext(chainID, "example02", "0", "", false, nil)
+	cccid1 := ccprovider.NewCCContext(chainID, "example02", "0", "", false, nil, nil)
 
-	_, err := deploy(ctxt, cccid1, spec1)
+	var nextBlockNumber uint64
 
-	chaincodeID1 := spec1.ChaincodeID.Name
+	_, err := deploy(ctxt, cccid1, spec1, nextBlockNumber)
+	nextBlockNumber++
+
+	ccID1 := spec1.ChaincodeId.Name
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
-		return fmt.Errorf("Error initializing chaincode %s(%s)", chaincodeID1, err)
+		return fmt.Errorf("Error initializing chaincode %s(%s)", ccID1, err)
 	}
 
 	time.Sleep(time.Second)
@@ -398,37 +443,39 @@ func chaincodeQueryChaincode(chainID string, user string) error {
 	// Deploy second chaincode
 	url2 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example05"
 
-	cID2 := &pb.ChaincodeID{Name: "example05", Path: url2}
+	cID2 := &pb.ChaincodeID{Name: "example05", Path: url2, Version: "0"}
 	f = "init"
 	args = util.ToChaincodeArgs(f, "sum", "0")
 
-	spec2 := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	spec2 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
 
-	cccid2 := ccprovider.NewCCContext(chainID, "example05", "0", "", false, nil)
+	cccid2 := ccprovider.NewCCContext(chainID, "example05", "0", "", false, nil, nil)
 
-	_, err = deploy(ctxt, cccid2, spec2)
-	chaincodeID2 := spec2.ChaincodeID.Name
+	_, err = deploy(ctxt, cccid2, spec2, nextBlockNumber)
+	nextBlockNumber++
+	ccID2 := spec2.ChaincodeId.Name
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-		return fmt.Errorf("Error initializing chaincode %s(%s)", chaincodeID2, err)
+		return fmt.Errorf("Error initializing chaincode %s(%s)", ccID2, err)
 	}
 
 	time.Sleep(time.Second)
 
 	// Invoke second chaincode, which will inturn query the first chaincode
 	f = "invoke"
-	args = util.ToChaincodeArgs(f, chaincodeID1, "sum")
+	args = util.ToChaincodeArgs(f, ccID1, "sum")
 
-	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
 	// Invoke chaincode
 	var retVal []byte
-	_, _, retVal, err = invoke(ctxt, chainID, spec2)
+	_, _, retVal, err = invoke(ctxt, chainID, spec2, nextBlockNumber, []byte("Alice"))
+	nextBlockNumber++
 
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-		return fmt.Errorf("Error invoking <%s>: %s", chaincodeID2, err)
+		return fmt.Errorf("Error invoking <%s>: %s", ccID2, err)
 	}
 
 	// Check the return value
@@ -436,21 +483,21 @@ func chaincodeQueryChaincode(chainID string, user string) error {
 	if err != nil || result != 300 {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-		return fmt.Errorf("Incorrect final state after transaction for <%s>: %s", chaincodeID1, err)
+		return fmt.Errorf("Incorrect final state after transaction for <%s>: %s", ccID1, err)
 	}
 
 	// Query second chaincode, which will inturn query the first chaincode
 	f = "query"
-	args = util.ToChaincodeArgs(f, chaincodeID1, "sum")
+	args = util.ToChaincodeArgs(f, ccID1, "sum")
 
-	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
 	// Invoke chaincode
-	_, _, retVal, err = invoke(ctxt, chainID, spec2)
+	_, _, retVal, err = invoke(ctxt, chainID, spec2, nextBlockNumber, []byte("Alice"))
 
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-		return fmt.Errorf("Error querying <%s>: %s", chaincodeID2, err)
+		return fmt.Errorf("Error querying <%s>: %s", ccID2, err)
 	}
 
 	// Check the return value
@@ -458,30 +505,13 @@ func chaincodeQueryChaincode(chainID string, user string) error {
 	if err != nil || result != 300 {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-		return fmt.Errorf("Incorrect final value after query for <%s>: %s", chaincodeID1, err)
+		return fmt.Errorf("Incorrect final value after query for <%s>: %s", ccID1, err)
 	}
 
 	theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 	theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 
 	return nil
-}
-
-// Test deploy of a transaction
-func TestExecuteDeployTransaction(t *testing.T) {
-	chainID := util.GetTestChainID()
-
-	executeDeployTransaction(t, chainID, "example01", "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example01")
-}
-
-// Test deploy of a transaction with a GOPATH with multiple elements
-func TestGopathExecuteDeployTransaction(t *testing.T) {
-	chainID := util.GetTestChainID()
-
-	// add a trailing slash to GOPATH
-	// and a couple of elements - it doesn't matter what they are
-	os.Setenv("GOPATH", os.Getenv("GOPATH")+string(os.PathSeparator)+string(os.PathListSeparator)+"/tmp/foo"+string(os.PathListSeparator)+"/tmp/bar")
-	executeDeployTransaction(t, chainID, "example01", "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example01")
 }
 
 // Disable this temporarily.
@@ -540,15 +570,17 @@ func checkFinalState(cccid *ccprovider.CCContext) error {
 }
 
 // Invoke chaincode_example02
-func invokeExample02Transaction(ctxt context.Context, cccid *ccprovider.CCContext, cID *pb.ChaincodeID, args []string, destroyImage bool) error {
-
+func invokeExample02Transaction(ctxt context.Context, cccid *ccprovider.CCContext, cID *pb.ChaincodeID, chaincodeType pb.ChaincodeSpec_Type, args []string, destroyImage bool) error {
+	// the ledger is created with genesis block. Start block number 1 onwards
+	var nextBlockNumber uint64 = 1
 	f := "init"
 	argsDeploy := util.ToChaincodeArgs(f, "a", "100", "b", "200")
-	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: argsDeploy}}
-	_, err := deploy(ctxt, cccid, spec)
-	chaincodeID := spec.ChaincodeID.Name
+	spec := &pb.ChaincodeSpec{Type: chaincodeType, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: argsDeploy}}
+	_, err := deploy(ctxt, cccid, spec, nextBlockNumber)
+	nextBlockNumber++
+	ccID := spec.ChaincodeId.Name
 	if err != nil {
-		return fmt.Errorf("Error deploying <%s>: %s", chaincodeID, err)
+		return fmt.Errorf("Error deploying <%s>: %s", ccID, err)
 	}
 
 	time.Sleep(time.Second)
@@ -566,8 +598,9 @@ func invokeExample02Transaction(ctxt context.Context, cccid *ccprovider.CCContex
 
 	f = "invoke"
 	invokeArgs := append([]string{f}, args...)
-	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: util.ToChaincodeArgs(invokeArgs...)}}
-	_, uuid, _, err := invoke(ctxt, cccid.ChainID, spec)
+	spec = &pb.ChaincodeSpec{ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: util.ToChaincodeArgs(invokeArgs...)}}
+	_, uuid, _, err := invoke(ctxt, cccid.ChainID, spec, nextBlockNumber, nil)
+	nextBlockNumber++
 	if err != nil {
 		return fmt.Errorf("Error invoking <%s>: %s", cccid.Name, err)
 	}
@@ -575,14 +608,14 @@ func invokeExample02Transaction(ctxt context.Context, cccid *ccprovider.CCContex
 	cccid.TxID = uuid
 	err = checkFinalState(cccid)
 	if err != nil {
-		return fmt.Errorf("Incorrect final state after transaction for <%s>: %s", chaincodeID, err)
+		return fmt.Errorf("Incorrect final state after transaction for <%s>: %s", ccID, err)
 	}
 
 	// Test for delete state
 	f = "delete"
 	delArgs := util.ToChaincodeArgs(f, "a")
-	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: delArgs}}
-	_, uuid, _, err = invoke(ctxt, cccid.ChainID, spec)
+	spec = &pb.ChaincodeSpec{ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: delArgs}}
+	_, _, _, err = invoke(ctxt, cccid.ChainID, spec, nextBlockNumber, nil)
 	if err != nil {
 		return fmt.Errorf("Error deleting state in <%s>: %s", cccid.Name, err)
 	}
@@ -590,34 +623,243 @@ func invokeExample02Transaction(ctxt context.Context, cccid *ccprovider.CCContex
 	return nil
 }
 
-func TestExecuteInvokeTransaction(t *testing.T) {
-	chainID := util.GetTestChainID()
+const (
+	chaincodeExample02GolangPath = "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02"
+	chaincodeExample02JavaPath   = "../../examples/chaincode/java/chaincode_example02"
+	chaincodeExample06JavaPath   = "../../examples/chaincode/java/chaincode_example06"
+)
 
-	lis, err := initPeer(chainID)
-	if err != nil {
-		t.Fail()
-		t.Logf("Error creating peer: %s", err)
-	}
-
-	defer finitPeer(lis, chainID)
-
+func runChaincodeInvokeChaincode(t *testing.T, chainID1 string, chainID2 string, _ string) (err error) {
 	var ctxt = context.Background()
 
-	cccid := ccprovider.NewCCContext(chainID, "example02", "0", "", false, nil)
-	url := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02"
-	chaincodeID := &pb.ChaincodeID{Name: "example02", Path: url}
+	// Deploy first chaincode
+	url1 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02"
 
-	args := []string{"a", "b", "10"}
-	err = invokeExample02Transaction(ctxt, cccid, chaincodeID, args, true)
+	cID1 := &pb.ChaincodeID{Name: "example02", Path: url1, Version: "0"}
+	f := "init"
+	args := util.ToChaincodeArgs(f, "a", "100", "b", "200")
+
+	spec1 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID1, Input: &pb.ChaincodeInput{Args: args}}
+
+	sProp, prop := putils.MockSignedEndorserProposalOrPanic(chainID1, spec1, []byte([]byte("Alice")), nil)
+	cccid1 := ccprovider.NewCCContext(chainID1, "example02", "0", "", false, sProp, prop)
+
+	var nextBlockNumber uint64 = 1
+
+	_, err = deploy(ctxt, cccid1, spec1, nextBlockNumber)
+	nextBlockNumber++
+	ccID1 := spec1.ChaincodeId.Name
 	if err != nil {
 		t.Fail()
-		t.Logf("Error invoking transaction: %s", err)
-	} else {
-		fmt.Printf("Invoke test passed\n")
-		t.Logf("Invoke test passed")
+		t.Logf("Error initializing chaincode %s(%s)", ccID1, err)
+		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
+		return
 	}
 
-	theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: &pb.ChaincodeSpec{ChaincodeID: chaincodeID}})
+	t.Logf("deployed chaincode_example02 got cID1:% s,\n ccID1:% s", cID1, ccID1)
+
+	time.Sleep(time.Second)
+
+	// Deploy second chaincode
+	url2 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example04"
+
+	cID2 := &pb.ChaincodeID{Name: "example04", Path: url2, Version: "0"}
+	f = "init"
+	args = util.ToChaincodeArgs(f, "e", "0")
+
+	spec2 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
+
+	sProp, prop = putils.MockSignedEndorserProposalOrPanic(chainID1, spec2, []byte([]byte("Alice")), nil)
+	cccid2 := ccprovider.NewCCContext(chainID1, "example04", "0", "", false, sProp, prop)
+
+	_, err = deploy(ctxt, cccid2, spec2, nextBlockNumber)
+	nextBlockNumber++
+	ccID2 := spec2.ChaincodeId.Name
+	if err != nil {
+		t.Fail()
+		t.Logf("Error initializing chaincode %s(%s)", ccID2, err)
+		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
+		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
+		return
+	}
+
+	time.Sleep(time.Second)
+
+	// Invoke second chaincode passing the first chaincode's name as first param,
+	// which will inturn invoke the first chaincode
+	f = "invoke"
+	cid := spec1.ChaincodeId.Name
+	args = util.ToChaincodeArgs(f, cid, "e", "1")
+
+	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	// Invoke chaincode
+	var uuid string
+	_, uuid, _, err = invoke(ctxt, chainID1, spec2, nextBlockNumber, []byte("Alice"))
+
+	if err != nil {
+		t.Fail()
+		t.Logf("Error invoking <%s>: %s", ccID2, err)
+		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
+		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
+		return
+	}
+
+	cccid1.TxID = uuid
+
+	// Check the state in the ledger
+	err = checkFinalState(cccid1)
+	if err != nil {
+		t.Fail()
+		t.Logf("Incorrect final state after transaction for <%s>: %s", ccID1, err)
+		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
+		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
+		return
+	}
+
+	// Change the policies of the two channels in such a way:
+	// 1. Alice has reader access to both the channels.
+	// 2. Bob has access only to chainID2.
+	// Therefore the chaincode invocation should fail.
+	pm := peer.GetPolicyManager(chainID1)
+	pm.(*mockpolicies.Manager).PolicyMap = map[string]policies.Policy{
+		policies.ChannelApplicationWriters: &CreatorPolicy{Creators: [][]byte{[]byte("Alice")}},
+	}
+
+	pm = peer.GetPolicyManager(chainID2)
+	pm.(*mockpolicies.Manager).PolicyMap = map[string]policies.Policy{
+		policies.ChannelApplicationWriters: &CreatorPolicy{Creators: [][]byte{[]byte("Alice"), []byte("Bob")}},
+	}
+
+	url2 = "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example04"
+
+	cID2 = &pb.ChaincodeID{Name: "example04", Path: url2, Version: "0"}
+	f = "init"
+	args = util.ToChaincodeArgs(f, "e", "0")
+
+	spec3 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	sProp, prop = putils.MockSignedEndorserProposalOrPanic(chainID2, spec3, []byte([]byte("Alice")), nil)
+	cccid3 := ccprovider.NewCCContext(chainID2, "example04", "0", "", false, sProp, prop)
+
+	_, err = deploy(ctxt, cccid3, spec3, 1)
+	chaincodeID2 := spec2.ChaincodeId.Name
+	if err != nil {
+		t.Fail()
+		t.Logf("Error initializing chaincode %s(%s)", chaincodeID2, err)
+		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
+		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
+		theChaincodeSupport.Stop(ctxt, cccid3, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec3})
+		return
+	}
+
+	time.Sleep(time.Second)
+	//
+	// - Invoke second chaincode passing the first chaincode's name as first param, which will in turn invoke the first chaincode
+	f = "invoke"
+	cid = spec1.ChaincodeId.Name
+	args = util.ToChaincodeArgs(f, cid, "e", "1", chainID1)
+
+	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	// Invoke chaincode
+	//var uuid string
+
+	// Bob should not be able to call
+	_, _, _, err = invoke(ctxt, chainID2, spec2, 2, []byte("Bob"))
+	if err == nil {
+		t.Fail()
+		t.Logf("Bob invoking <%s> should fail. It did not happen instead: %s", chaincodeID2, err)
+		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
+		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
+		theChaincodeSupport.Stop(ctxt, cccid3, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec3})
+		return
+	}
+
+	// Alice should be able to call
+	_, _, _, err = invoke(ctxt, chainID2, spec2, 2, []byte("Alice"))
+	if err != nil {
+		t.Fail()
+		t.Logf("Alice invoking <%s> should not fail. It did happen instead: %s", chaincodeID2, err)
+		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
+		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
+		theChaincodeSupport.Stop(ctxt, cccid3, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec3})
+		return
+	}
+
+	theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
+	theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
+	theChaincodeSupport.Stop(ctxt, cccid3, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec3})
+
+	return nil
+}
+
+// Test deploy of a transaction
+func TestExecuteDeployTransaction(t *testing.T) {
+	//chaincoe is deployed as part of many tests. No need for a separate one for this
+	t.Skip()
+	chainID := util.GetTestChainID()
+
+	executeDeployTransaction(t, chainID, "example01", "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example01")
+}
+
+// Test deploy of a transaction with a GOPATH with multiple elements
+func TestGopathExecuteDeployTransaction(t *testing.T) {
+	//this is no longer critical as chaincode is assembled in the client side (SDK)
+	t.Skip()
+	chainID := util.GetTestChainID()
+
+	// add a trailing slash to GOPATH
+	// and a couple of elements - it doesn't matter what they are
+	os.Setenv("GOPATH", os.Getenv("GOPATH")+string(os.PathSeparator)+string(os.PathListSeparator)+"/tmp/foo"+string(os.PathListSeparator)+"/tmp/bar")
+	executeDeployTransaction(t, chainID, "example01", "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example01")
+}
+
+func TestExecuteInvokeTransaction(t *testing.T) {
+
+	testCases := []struct {
+		chaincodeType pb.ChaincodeSpec_Type
+		chaincodePath string
+	}{
+		{pb.ChaincodeSpec_GOLANG, chaincodeExample02GolangPath},
+		{pb.ChaincodeSpec_JAVA, chaincodeExample02JavaPath},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.chaincodeType.String(), func(t *testing.T) {
+
+			if tc.chaincodeType == pb.ChaincodeSpec_JAVA && runtime.GOARCH != "amd64" {
+				t.Skip("No Java chaincode support yet on non-x86_64.")
+			}
+
+			chainID := util.GetTestChainID()
+
+			lis, err := initPeer(chainID)
+			if err != nil {
+				t.Fail()
+				t.Logf("Error creating peer: %s", err)
+			}
+
+			defer finitPeer(lis, chainID)
+
+			var ctxt = context.Background()
+			chaincodeName := generateChaincodeName(tc.chaincodeType)
+			chaincodeVersion := "1.0.0.0"
+			cccid := ccprovider.NewCCContext(chainID, chaincodeName, chaincodeVersion, "", false, nil, nil)
+			ccID := &pb.ChaincodeID{Name: chaincodeName, Path: tc.chaincodePath, Version: chaincodeVersion}
+
+			args := []string{"a", "b", "10"}
+			err = invokeExample02Transaction(ctxt, cccid, ccID, tc.chaincodeType, args, true)
+			if err != nil {
+				t.Fail()
+				t.Logf("Error invoking transaction: %s", err)
+			} else {
+				fmt.Print("Invoke test passed\n")
+				t.Log("Invoke test passed")
+			}
+
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: &pb.ChaincodeSpec{ChaincodeId: ccID}})
+
+		})
+	}
+
 }
 
 // Test the execution of an invalid transaction.
@@ -635,20 +877,20 @@ func TestExecuteInvokeInvalidTransaction(t *testing.T) {
 	var ctxt = context.Background()
 
 	url := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02"
-	chaincodeID := &pb.ChaincodeID{Name: "example02", Path: url}
+	ccID := &pb.ChaincodeID{Name: "example02", Path: url, Version: "0"}
 
-	cccid := ccprovider.NewCCContext(chainID, "example02", "0", "", false, nil)
+	cccid := ccprovider.NewCCContext(chainID, "example02", "0", "", false, nil, nil)
 
 	//FAIL, FAIL!
 	args := []string{"x", "-1"}
-	err = invokeExample02Transaction(ctxt, cccid, chaincodeID, args, false)
+	err = invokeExample02Transaction(ctxt, cccid, ccID, pb.ChaincodeSpec_GOLANG, args, false)
 
 	//this HAS to fail with expectedDeltaStringPrefix
 	if err != nil {
 		errStr := err.Error()
 		t.Logf("Got error %s\n", errStr)
-		t.Logf("InvalidInvoke test passed")
-		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: &pb.ChaincodeSpec{ChaincodeID: chaincodeID}})
+		t.Log("InvalidInvoke test passed")
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: &pb.ChaincodeSpec{ChaincodeId: ccID}})
 
 		return
 	}
@@ -656,22 +898,23 @@ func TestExecuteInvokeInvalidTransaction(t *testing.T) {
 	t.Fail()
 	t.Logf("Error invoking transaction %s", err)
 
-	theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: &pb.ChaincodeSpec{ChaincodeID: chaincodeID}})
+	theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: &pb.ChaincodeSpec{ChaincodeId: ccID}})
 }
 
 // Test the execution of a chaincode that invokes another chaincode.
 func TestChaincodeInvokeChaincode(t *testing.T) {
-	chainID := util.GetTestChainID()
+	chainID1 := util.GetTestChainID()
+	chainID2 := chainID1 + "2"
 
-	lis, err := initPeer(chainID)
+	lis, err := initPeer(chainID1, chainID2)
 	if err != nil {
 		t.Fail()
 		t.Logf("Error creating peer: %s", err)
 	}
 
-	defer finitPeer(lis, chainID)
+	defer finitPeer(lis, chainID1, chainID2)
 
-	err = chaincodeInvokeChaincode(t, chainID, "")
+	err = runChaincodeInvokeChaincode(t, chainID1, chainID2, "")
 	if err != nil {
 		t.Fail()
 		t.Logf("Failed chaincode invoke chaincode : %s", err)
@@ -680,93 +923,6 @@ func TestChaincodeInvokeChaincode(t *testing.T) {
 	}
 
 	closeListenerAndSleep(lis)
-}
-
-func chaincodeInvokeChaincode(t *testing.T, chainID string, user string) (err error) {
-	var ctxt = context.Background()
-
-	// Deploy first chaincode
-	url1 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02"
-
-	cID1 := &pb.ChaincodeID{Name: "example02", Path: url1}
-	f := "init"
-	args := util.ToChaincodeArgs(f, "a", "100", "b", "200")
-
-	spec1 := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID1, Input: &pb.ChaincodeInput{Args: args}}
-
-	cccid1 := ccprovider.NewCCContext(chainID, "example02", "0", "", false, nil)
-
-	_, err = deploy(ctxt, cccid1, spec1)
-	chaincodeID1 := spec1.ChaincodeID.Name
-	if err != nil {
-		t.Fail()
-		t.Logf("Error initializing chaincode %s(%s)", chaincodeID1, err)
-		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
-		return
-	}
-
-	t.Logf("deployed chaincode_example02 got cID1:% s,\n chaincodeID1:% s", cID1, chaincodeID1)
-
-	time.Sleep(time.Second)
-
-	// Deploy second chaincode
-	url2 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example04"
-
-	cID2 := &pb.ChaincodeID{Name: "example04", Path: url2}
-	f = "init"
-	args = util.ToChaincodeArgs(f, "e", "0")
-
-	spec2 := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
-
-	cccid2 := ccprovider.NewCCContext(chainID, "example04", "0", "", false, nil)
-
-	_, err = deploy(ctxt, cccid2, spec2)
-	chaincodeID2 := spec2.ChaincodeID.Name
-	if err != nil {
-		t.Fail()
-		t.Logf("Error initializing chaincode %s(%s)", chaincodeID2, err)
-		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
-		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-		return
-	}
-
-	time.Sleep(time.Second)
-
-	// Invoke second chaincode passing the first chaincode's name as first param,
-	// which will inturn invoke the first chaincode
-	f = "invoke"
-	cid := spec1.ChaincodeID.Name
-	args = util.ToChaincodeArgs(f, cid, "e", "1")
-
-	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
-	// Invoke chaincode
-	var uuid string
-	_, uuid, _, err = invoke(ctxt, chainID, spec2)
-
-	if err != nil {
-		t.Fail()
-		t.Logf("Error invoking <%s>: %s", chaincodeID2, err)
-		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
-		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-		return
-	}
-
-	cccid1.TxID = uuid
-
-	// Check the state in the ledger
-	err = checkFinalState(cccid1)
-	if err != nil {
-		t.Fail()
-		t.Logf("Incorrect final state after transaction for <%s>: %s", chaincodeID1, err)
-		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
-		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-		return
-	}
-
-	theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
-	theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
-
-	return
 }
 
 // Test the execution of a chaincode that invokes another chaincode with wrong parameters. Should receive error from
@@ -787,19 +943,23 @@ func TestChaincodeInvokeChaincodeErrorCase(t *testing.T) {
 	// Deploy first chaincode
 	url1 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02"
 
-	cID1 := &pb.ChaincodeID{Name: "example02", Path: url1}
+	cID1 := &pb.ChaincodeID{Name: "example02", Path: url1, Version: "0"}
 	f := "init"
 	args := util.ToChaincodeArgs(f, "a", "100", "b", "200")
 
-	spec1 := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID1, Input: &pb.ChaincodeInput{Args: args}}
+	spec1 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID1, Input: &pb.ChaincodeInput{Args: args}}
 
-	cccid1 := ccprovider.NewCCContext(chainID, "example02", "0", "", false, nil)
+	sProp, prop := putils.MockSignedEndorserProposalOrPanic(util.GetTestChainID(), spec1, []byte([]byte("Alice")), nil)
+	cccid1 := ccprovider.NewCCContext(chainID, "example02", "0", "", false, sProp, prop)
 
-	_, err = deploy(ctxt, cccid1, spec1)
-	chaincodeID1 := spec1.ChaincodeID.Name
+	var nextBlockNumber uint64 = 1
+
+	_, err = deploy(ctxt, cccid1, spec1, nextBlockNumber)
+	nextBlockNumber++
+	ccID1 := spec1.ChaincodeId.Name
 	if err != nil {
 		t.Fail()
-		t.Logf("Error initializing chaincode %s(%s)", chaincodeID1, err)
+		t.Logf("Error initializing chaincode %s(%s)", ccID1, err)
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		return
 	}
@@ -809,19 +969,20 @@ func TestChaincodeInvokeChaincodeErrorCase(t *testing.T) {
 	// Deploy second chaincode
 	url2 := "github.com/hyperledger/fabric/examples/chaincode/go/passthru"
 
-	cID2 := &pb.ChaincodeID{Name: "pthru", Path: url2}
+	cID2 := &pb.ChaincodeID{Name: "pthru", Path: url2, Version: "0"}
 	f = "init"
 	args = util.ToChaincodeArgs(f)
 
-	spec2 := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	spec2 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
 
-	cccid2 := ccprovider.NewCCContext(chainID, "pthru", "0", "", false, nil)
+	cccid2 := ccprovider.NewCCContext(chainID, "pthru", "0", "", false, sProp, prop)
 
-	_, err = deploy(ctxt, cccid2, spec2)
-	chaincodeID2 := spec2.ChaincodeID.Name
+	_, err = deploy(ctxt, cccid2, spec2, nextBlockNumber)
+	nextBlockNumber++
+	ccID2 := spec2.ChaincodeId.Name
 	if err != nil {
 		t.Fail()
-		t.Logf("Error initializing chaincode %s(%s)", chaincodeID2, err)
+		t.Logf("Error initializing chaincode %s(%s)", ccID2, err)
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 		return
@@ -830,16 +991,16 @@ func TestChaincodeInvokeChaincodeErrorCase(t *testing.T) {
 	time.Sleep(time.Second)
 
 	// Invoke second chaincode, which will inturn invoke the first chaincode but pass bad params
-	f = chaincodeID1
+	f = ccID1
 	args = util.ToChaincodeArgs(f, "invoke", "a")
 
-	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
 	// Invoke chaincode
-	_, _, _, err = invoke(ctxt, chainID, spec2)
+	_, _, _, err = invoke(ctxt, chainID, spec2, nextBlockNumber, []byte("Alice"))
 
 	if err == nil {
 		t.Fail()
-		t.Logf("Error invoking <%s>: %s", chaincodeID2, err)
+		t.Logf("Error invoking <%s>: %s", ccID2, err)
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 		return
@@ -873,88 +1034,275 @@ func TestQueries(t *testing.T) {
 	var ctxt = context.Background()
 
 	url := "github.com/hyperledger/fabric/examples/chaincode/go/map"
-	cID := &pb.ChaincodeID{Name: "tmap", Path: url}
+	cID := &pb.ChaincodeID{Name: "tmap", Path: url, Version: "0"}
 
 	f := "init"
 	args := util.ToChaincodeArgs(f)
 
-	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: args}}
+	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
 
-	cccid := ccprovider.NewCCContext(chainID, "tmap", "0", "", false, nil)
+	cccid := ccprovider.NewCCContext(chainID, "tmap", "0", "", false, nil, nil)
 
-	_, err = deploy(ctxt, cccid, spec)
-	chaincodeID := spec.ChaincodeID.Name
+	var nextBlockNumber uint64 = 1
+	_, err = deploy(ctxt, cccid, spec, nextBlockNumber)
+	nextBlockNumber++
+	ccID := spec.ChaincodeId.Name
 	if err != nil {
 		t.Fail()
-		t.Logf("Error initializing chaincode %s(%s)", chaincodeID, err)
+		t.Logf("Error initializing chaincode %s(%s)", ccID, err)
 		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
 		return
 	}
 
-	// Invoke second chaincode, which will inturn invoke the first chaincode
-	f = "put"
-	args = util.ToChaincodeArgs(f, "key1", "{\"shipmentID\":\"161003PKC7300\",\"customsInvoice\":{\"methodOfTransport\":\"GROUND\",\"invoiceNumber\":\"00091622\"},\"weightUnitOfMeasure\":\"KGM\",\"volumeUnitOfMeasure\": \"CO\",\"dimensionUnitOfMeasure\":\"CM\",\"currency\":\"USD\"}")
-	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: args}}
-	_, _, _, err = invoke(ctxt, chainID, spec)
+	// Add 101 marbles for testing range queries and rich queries (for capable ledgers)
+	// The tests will test both range and rich queries and queries with query limits
+	for i := 1; i <= 101; i++ {
+		f = "put"
 
-	if err != nil {
-		t.Fail()
-		t.Logf("Error invoking <%s>: %s", chaincodeID, err)
-		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
-		return
-	}
+		// 51 owned by tom, 50 by jerry
+		owner := "tom"
+		if i%2 == 0 {
+			owner = "jerry"
+		}
 
-	f = "put"
-	args = util.ToChaincodeArgs(f, "key2", "{\"shipmentID\":\"161003PKC7300\",\"customsInvoice\":{\"methodOfTransport\":\"GROUND\",\"invoiceNumber\":\"00091622\"},\"weightUnitOfMeasure\":\"KGM\",\"volumeUnitOfMeasure\": \"CO\",\"dimensionUnitOfMeasure\":\"CM\",\"currency\":\"USD\"}")
-	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: args}}
-	_, _, _, err = invoke(ctxt, chainID, spec)
+		// one marble color is red, 100 are blue
+		color := "blue"
+		if i == 12 {
+			color = "red"
+		}
 
-	if err != nil {
-		t.Fail()
-		t.Logf("Error invoking <%s>: %s", chaincodeID, err)
-		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
-		return
-	}
-
-	f = "put"
-	args = util.ToChaincodeArgs(f, "key3", "{\"shipmentID\":\"161003PKC7300\",\"customsInvoice\":{\"methodOfTransport\":\"GROUND\",\"invoiceNumber\":\"00091622\"},\"weightUnitOfMeasure\":\"KGM\",\"volumeUnitOfMeasure\": \"CO\",\"dimensionUnitOfMeasure\":\"CM\",\"currency\":\"USD\"}")
-	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: args}}
-	_, _, _, err = invoke(ctxt, chainID, spec)
-
-	if err != nil {
-		t.Fail()
-		t.Logf("Error invoking <%s>: %s", chaincodeID, err)
-		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
-		return
-	}
-
-	f = "keys"
-	args = util.ToChaincodeArgs(f, "key0", "key3")
-
-	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: args}}
-	_, _, _, err = invoke(ctxt, chainID, spec)
-
-	if err != nil {
-		t.Fail()
-		t.Logf("Error invoking <%s>: %s", chaincodeID, err)
-		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
-		return
-	}
-
-	if ledgerconfig.IsCouchDBEnabled() == true {
-		f = "query"
-		args = util.ToChaincodeArgs(f, "{\"selector\":{\"currency\":\"USD\"}}")
-
-		spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: args}}
-		_, _, _, err = invoke(ctxt, chainID, spec)
+		key := fmt.Sprintf("marble%03d", i)
+		argsString := fmt.Sprintf("{\"docType\":\"marble\",\"name\":\"%s\",\"color\":\"%s\",\"size\":35,\"owner\":\"%s\"}", key, color, owner)
+		args = util.ToChaincodeArgs(f, key, argsString)
+		spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+		_, _, _, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+		nextBlockNumber++
 
 		if err != nil {
 			t.Fail()
-			t.Logf("Error invoking <%s>: %s", chaincodeID, err)
+			t.Logf("Error invoking <%s>: %s", ccID, err)
 			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
 			return
 		}
 	}
+
+	//The following range query for "marble001" to "marble011" should return 10 marbles
+	f = "keys"
+	args = util.ToChaincodeArgs(f, "marble001", "marble011")
+
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+	_, _, retval, err := invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+	nextBlockNumber++
+	if err != nil {
+		t.Fail()
+		t.Logf("Error invoking <%s>: %s", ccID, err)
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	var keys []interface{}
+	err = json.Unmarshal(retval, &keys)
+	if len(keys) != 10 {
+		t.Fail()
+		t.Logf("Error detected with the range query, should have returned 10 but returned %v", len(keys))
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	// querying for all marbles will return 101 marbles
+	// this query should return exactly 101 results (one call to Next())
+	//The following range query for "marble001" to "marble102" should return 101 marbles
+	f = "keys"
+	args = util.ToChaincodeArgs(f, "marble001", "marble102")
+
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+	_, _, retval, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+	nextBlockNumber++
+	if err != nil {
+		t.Fail()
+		t.Logf("Error invoking <%s>: %s", ccID, err)
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	//unmarshal the results
+	err = json.Unmarshal(retval, &keys)
+
+	//check to see if there are 101 values
+	//default query limit of 10000 is used, this query is effectively unlimited
+	if len(keys) != 101 {
+		t.Fail()
+		t.Logf("Error detected with the range query, should have returned 101 but returned %v", len(keys))
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	// ExecuteQuery supported only for CouchDB and
+	// query limits apply for CouchDB range and rich queries only
+	if ledgerconfig.IsCouchDBEnabled() == true {
+
+		// corner cases for shim batching. currnt shim batch size is 100
+		// this query should return exactly 100 results (no call to Next())
+		f = "query"
+		args = util.ToChaincodeArgs(f, "{\"selector\":{\"color\":\"blue\"}}")
+
+		spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+		_, _, _, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+		nextBlockNumber++
+
+		if err != nil {
+			t.Fail()
+			t.Logf("Error invoking <%s>: %s", ccID, err)
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+			return
+		}
+
+		//unmarshal the results
+		err = json.Unmarshal(retval, &keys)
+
+		//check to see if there are 100 values
+		if len(keys) != 100 {
+			t.Fail()
+			t.Logf("Error detected with the rich query, should have returned 100 but returned %v %s", len(keys), keys)
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+			return
+		}
+
+		//Reset the query limit to 5
+		viper.Set("ledger.state.queryLimit", 5)
+
+		//The following range query for "marble01" to "marble11" should return 5 marbles due to the queryLimit
+		f = "keys"
+		args = util.ToChaincodeArgs(f, "marble001", "marble011")
+
+		spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+		_, _, retval, err := invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+		nextBlockNumber++
+		if err != nil {
+			t.Fail()
+			t.Logf("Error invoking <%s>: %s", ccID, err)
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+			return
+		}
+
+		//unmarshal the results
+		err = json.Unmarshal(retval, &keys)
+
+		//check to see if there are 5 values
+		if len(keys) != 5 {
+			t.Fail()
+			t.Logf("Error detected with the range query, should have returned 5 but returned %v", len(keys))
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+			return
+		}
+
+		//Reset the query limit to 10000
+		viper.Set("ledger.state.queryLimit", 10000)
+
+		//The following rich query for should return 50 marbles
+		f = "query"
+		args = util.ToChaincodeArgs(f, "{\"selector\":{\"owner\":\"jerry\"}}")
+
+		spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+		_, _, retval, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+		nextBlockNumber++
+
+		if err != nil {
+			t.Fail()
+			t.Logf("Error invoking <%s>: %s", ccID, err)
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+			return
+		}
+
+		//unmarshal the results
+		err = json.Unmarshal(retval, &keys)
+
+		//check to see if there are 50 values
+		//default query limit of 10000 is used, this query is effectively unlimited
+		if len(keys) != 50 {
+			t.Fail()
+			t.Logf("Error detected with the rich query, should have returned 9 but returned %v", len(keys))
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+			return
+		}
+
+		//Reset the query limit to 5
+		viper.Set("ledger.state.queryLimit", 5)
+
+		//The following rich query should return 5 marbles due to the queryLimit
+		f = "query"
+		args = util.ToChaincodeArgs(f, "{\"selector\":{\"owner\":\"jerry\"}}")
+
+		spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+		_, _, retval, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+		nextBlockNumber++
+		if err != nil {
+			t.Fail()
+			t.Logf("Error invoking <%s>: %s", ccID, err)
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+			return
+		}
+
+		//unmarshal the results
+		err = json.Unmarshal(retval, &keys)
+
+		//check to see if there are 5 values
+		if len(keys) != 5 {
+			t.Fail()
+			t.Logf("Error detected with the rich query, should have returned 5 but returned %v", len(keys))
+			theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+			return
+		}
+
+	}
+
+	// modifications for history query
+	f = "put"
+	args = util.ToChaincodeArgs(f, "marble012", "{\"docType\":\"marble\",\"name\":\"marble012\",\"color\":\"red\",\"size\":30,\"owner\":\"jerry\"}")
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+	_, _, _, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+	nextBlockNumber++
+	if err != nil {
+		t.Fail()
+		t.Logf("Error invoking <%s>: %s", ccID, err)
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	f = "put"
+	args = util.ToChaincodeArgs(f, "marble012", "{\"docType\":\"marble\",\"name\":\"marble012\",\"color\":\"red\",\"size\":30,\"owner\":\"jerry\"}")
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+	_, _, _, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+	nextBlockNumber++
+	if err != nil {
+		t.Fail()
+		t.Logf("Error invoking <%s>: %s", ccID, err)
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	//The following history query for "marble12" should return 3 records
+	f = "history"
+	args = util.ToChaincodeArgs(f, "marble012")
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+	_, _, retval, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+	nextBlockNumber++
+	if err != nil {
+		t.Fail()
+		t.Logf("Error invoking <%s>: %s", ccID, err)
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	var history []interface{}
+	err = json.Unmarshal(retval, &history)
+	if len(history) != 3 {
+		t.Fail()
+		t.Logf("Error detected with the history query, should have returned 3 but returned %v", len(keys))
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
 	theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
 }
 
@@ -973,17 +1321,18 @@ func TestGetEvent(t *testing.T) {
 
 	url := "github.com/hyperledger/fabric/examples/chaincode/go/eventsender"
 
-	cID := &pb.ChaincodeID{Name: "esender", Path: url}
+	cID := &pb.ChaincodeID{Name: "esender", Path: url, Version: "0"}
 	f := "init"
-	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: util.ToChaincodeArgs(f)}}
+	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: util.ToChaincodeArgs(f)}}
 
-	cccid := ccprovider.NewCCContext(chainID, "esender", "0", "", false, nil)
-
-	_, err = deploy(ctxt, cccid, spec)
-	chaincodeID := spec.ChaincodeID.Name
+	cccid := ccprovider.NewCCContext(chainID, "esender", "0", "", false, nil, nil)
+	var nextBlockNumber uint64 = 1
+	_, err = deploy(ctxt, cccid, spec, nextBlockNumber)
+	nextBlockNumber++
+	ccID := spec.ChaincodeId.Name
 	if err != nil {
 		t.Fail()
-		t.Logf("Error initializing chaincode %s(%s)", chaincodeID, err)
+		t.Logf("Error initializing chaincode %s(%s)", ccID, err)
 		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
 		return
 	}
@@ -992,23 +1341,23 @@ func TestGetEvent(t *testing.T) {
 
 	args := util.ToChaincodeArgs("invoke", "i", "am", "satoshi")
 
-	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID, Input: &pb.ChaincodeInput{Args: args}}
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
 
 	var ccevt *pb.ChaincodeEvent
-	ccevt, _, _, err = invoke(ctxt, chainID, spec)
+	ccevt, _, _, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
 
 	if err != nil {
-		t.Logf("Error invoking chaincode %s(%s)", chaincodeID, err)
+		t.Logf("Error invoking chaincode %s(%s)", ccID, err)
 		t.Fail()
 	}
 
 	if ccevt == nil {
-		t.Logf("Error ccevt is nil %s(%s)", chaincodeID, err)
+		t.Logf("Error ccevt is nil %s(%s)", ccID, err)
 		t.Fail()
 	}
 
-	if ccevt.ChaincodeID != chaincodeID {
-		t.Logf("Error ccevt id(%s) != cid(%s)", ccevt.ChaincodeID, chaincodeID)
+	if ccevt.ChaincodeId != ccID {
+		t.Logf("Error ccevt id(%s) != cid(%s)", ccevt.ChaincodeId, ccID)
 		t.Fail()
 	}
 
@@ -1023,6 +1372,9 @@ func TestGetEvent(t *testing.T) {
 // Test the execution of a chaincode that queries another chaincode
 // example02 implements "query" as a function in Invoke. example05 calls example02
 func TestChaincodeQueryChaincodeUsingInvoke(t *testing.T) {
+	//this is essentially same as the ChaincodeInvokeChaincode now that
+	//we don't distinguish between Invoke and Query (there's no separate "Query")
+	t.Skip()
 	chainID := util.GetTestChainID()
 
 	var peerLis net.Listener
@@ -1040,20 +1392,22 @@ func TestChaincodeQueryChaincodeUsingInvoke(t *testing.T) {
 	// Deploy first chaincode
 	url1 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02"
 
-	cID1 := &pb.ChaincodeID{Name: "example02", Path: url1}
+	cID1 := &pb.ChaincodeID{Name: "example02", Path: url1, Version: "0"}
 	f := "init"
 	args := util.ToChaincodeArgs(f, "a", "100", "b", "200")
 
-	spec1 := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID1, Input: &pb.ChaincodeInput{Args: args}}
+	spec1 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID1, Input: &pb.ChaincodeInput{Args: args}}
 
-	cccid1 := ccprovider.NewCCContext(chainID, "example02", "0", "", false, nil)
-
-	_, err = deploy(ctxt, cccid1, spec1)
-	chaincodeID1 := spec1.ChaincodeID.Name
+	sProp, prop := putils.MockSignedEndorserProposalOrPanic(util.GetTestChainID(), spec1, []byte([]byte("Alice")), nil)
+	cccid1 := ccprovider.NewCCContext(chainID, "example02", "0", "", false, sProp, prop)
+	var nextBlockNumber uint64
+	_, err = deploy(ctxt, cccid1, spec1, nextBlockNumber)
+	nextBlockNumber++
+	ccID1 := spec1.ChaincodeId.Name
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		t.Fail()
-		t.Logf("Error initializing chaincode %s(%s)", chaincodeID1, err)
+		t.Logf("Error initializing chaincode %s(%s)", ccID1, err)
 		return
 	}
 
@@ -1062,21 +1416,22 @@ func TestChaincodeQueryChaincodeUsingInvoke(t *testing.T) {
 	// Deploy second chaincode
 	url2 := "github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example05"
 
-	cID2 := &pb.ChaincodeID{Name: "example05", Path: url2}
+	cID2 := &pb.ChaincodeID{Name: "example05", Path: url2, Version: "0"}
 	f = "init"
 	args = util.ToChaincodeArgs(f, "sum", "0")
 
-	spec2 := &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	spec2 := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
 
-	cccid2 := ccprovider.NewCCContext(chainID, "example05", "0", "", false, nil)
+	cccid2 := ccprovider.NewCCContext(chainID, "example05", "0", "", false, sProp, prop)
 
-	_, err = deploy(ctxt, cccid2, spec2)
-	chaincodeID2 := spec2.ChaincodeID.Name
+	_, err = deploy(ctxt, cccid2, spec2, nextBlockNumber)
+	nextBlockNumber++
+	ccID2 := spec2.ChaincodeId.Name
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 		t.Fail()
-		t.Logf("Error initializing chaincode %s(%s)", chaincodeID2, err)
+		t.Logf("Error initializing chaincode %s(%s)", ccID2, err)
 		return
 	}
 
@@ -1084,18 +1439,18 @@ func TestChaincodeQueryChaincodeUsingInvoke(t *testing.T) {
 
 	// Invoke second chaincode, which will inturn query the first chaincode
 	f = "invoke"
-	args = util.ToChaincodeArgs(f, chaincodeID1, "sum")
+	args = util.ToChaincodeArgs(f, ccID1, "sum")
 
-	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
 	// Invoke chaincode
 	var retVal []byte
-	_, _, retVal, err = invoke(ctxt, chainID, spec2)
-
+	_, _, retVal, err = invoke(ctxt, chainID, spec2, nextBlockNumber, []byte("Alice"))
+	nextBlockNumber++
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 		t.Fail()
-		t.Logf("Error invoking <%s>: %s", chaincodeID2, err)
+		t.Logf("Error invoking <%s>: %s", ccID2, err)
 		return
 	}
 
@@ -1105,23 +1460,23 @@ func TestChaincodeQueryChaincodeUsingInvoke(t *testing.T) {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 		t.Fail()
-		t.Logf("Incorrect final state after transaction for <%s>: %s", chaincodeID1, err)
+		t.Logf("Incorrect final state after transaction for <%s>: %s", ccID1, err)
 		return
 	}
 
 	// Query second chaincode, which will inturn query the first chaincode
 	f = "query"
-	args = util.ToChaincodeArgs(f, chaincodeID1, "sum")
+	args = util.ToChaincodeArgs(f, ccID1, "sum")
 
-	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeID: cID2, Input: &pb.ChaincodeInput{Args: args}}
+	spec2 = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID2, Input: &pb.ChaincodeInput{Args: args}}
 	// Invoke chaincode
-	_, _, retVal, err = invoke(ctxt, chainID, spec2)
+	_, _, retVal, err = invoke(ctxt, chainID, spec2, nextBlockNumber, []byte("Alice"))
 
 	if err != nil {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 		t.Fail()
-		t.Logf("Error querying <%s>: %s", chaincodeID2, err)
+		t.Logf("Error querying <%s>: %s", ccID2, err)
 		return
 	}
 
@@ -1131,7 +1486,7 @@ func TestChaincodeQueryChaincodeUsingInvoke(t *testing.T) {
 		theChaincodeSupport.Stop(ctxt, cccid1, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec1})
 		theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 		t.Fail()
-		t.Logf("Incorrect final value after query for <%s>: %s", chaincodeID1, err)
+		t.Logf("Incorrect final value after query for <%s>: %s", ccID1, err)
 		return
 	}
 
@@ -1139,21 +1494,251 @@ func TestChaincodeQueryChaincodeUsingInvoke(t *testing.T) {
 	theChaincodeSupport.Stop(ctxt, cccid2, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec2})
 }
 
-var signer msp.SigningIdentity
+// test that invoking a security-sensitive system chaincode fails
+func TestChaincodeInvokesForbiddenSystemChaincode(t *testing.T) {
+	chainID := util.GetTestChainID()
+
+	lis, err := initPeer(chainID)
+	if err != nil {
+		t.Fail()
+		t.Logf("Error creating peer: %s", err)
+	}
+
+	defer finitPeer(lis, chainID)
+
+	var ctxt = context.Background()
+
+	var nextBlockNumber uint64 = 1
+
+	// Deploy second chaincode
+	url := "github.com/hyperledger/fabric/examples/chaincode/go/passthru"
+
+	cID := &pb.ChaincodeID{Name: "pthru", Path: url, Version: "0"}
+	f := "init"
+	args := util.ToChaincodeArgs(f)
+
+	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+
+	cccid := ccprovider.NewCCContext(chainID, "pthru", "0", "", false, nil, nil)
+
+	_, err = deploy(ctxt, cccid, spec, nextBlockNumber)
+	nextBlockNumber++
+	ccID := spec.ChaincodeId.Name
+	if err != nil {
+		t.Fail()
+		t.Logf("Error initializing chaincode %s(%s)", ccID, err)
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	time.Sleep(time.Second)
+
+	// send an invoke to pass thru to invoke "escc" system chaincode
+	// this should fail
+	args = util.ToChaincodeArgs("escc/"+chainID, "getid", chainID, "pthru")
+
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+	// Invoke chaincode
+	_, _, _, err = invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+	if err == nil {
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		t.Logf("invoking <%s> should have failed", ccID)
+		t.Fail()
+		return
+	}
+}
+
+// Test the execution of a chaincode that invokes system chaincode
+// uses the "pthru" chaincode to query "lscc" for the "pthru" chaincode
+func TestChaincodeInvokesSystemChaincode(t *testing.T) {
+	chainID := util.GetTestChainID()
+
+	lis, err := initPeer(chainID)
+	if err != nil {
+		t.Fail()
+		t.Logf("Error creating peer: %s", err)
+	}
+
+	defer finitPeer(lis, chainID)
+
+	var ctxt = context.Background()
+
+	var nextBlockNumber uint64 = 1
+
+	// Deploy second chaincode
+	url := "github.com/hyperledger/fabric/examples/chaincode/go/passthru"
+
+	cID := &pb.ChaincodeID{Name: "pthru", Path: url, Version: "0"}
+	f := "init"
+	args := util.ToChaincodeArgs(f)
+
+	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+
+	cccid := ccprovider.NewCCContext(chainID, "pthru", "0", "", false, nil, nil)
+
+	_, err = deploy(ctxt, cccid, spec, nextBlockNumber)
+	nextBlockNumber++
+	ccID := spec.ChaincodeId.Name
+	if err != nil {
+		t.Fail()
+		t.Logf("Error initializing chaincode %s(%s)", ccID, err)
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	time.Sleep(time.Second)
+
+	//send an invoke to pass thru to query "lscc" system chaincode on chainID to get
+	//information about "pthru"
+	args = util.ToChaincodeArgs("lscc/"+chainID, "getid", chainID, "pthru")
+
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: cID, Input: &pb.ChaincodeInput{Args: args}}
+	// Invoke chaincode
+	_, _, retval, err := invoke(ctxt, chainID, spec, nextBlockNumber, nil)
+
+	if err != nil {
+		t.Fail()
+		t.Logf("Error invoking <%s>: %s", ccID, err)
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	if string(retval) != "pthru" {
+		t.Fail()
+		t.Logf("Expected to get back \"pthru\" from lscc but got back %s", string(retval))
+		theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+		return
+	}
+
+	theChaincodeSupport.Stop(ctxt, cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+}
+
+func TestChaincodeInitializeInitError(t *testing.T) {
+	testCases := []struct {
+		name          string
+		chaincodeType pb.ChaincodeSpec_Type
+		chaincodePath string
+		args          []string
+	}{
+		{"NotSuccessResponse", pb.ChaincodeSpec_GOLANG, chaincodeExample02GolangPath, []string{"init", "not", "enough", "args"}},
+		{"NotSuccessResponse", pb.ChaincodeSpec_JAVA, chaincodeExample02JavaPath, []string{"init", "not", "enough", "args"}},
+		{"RuntimeException", pb.ChaincodeSpec_JAVA, chaincodeExample06JavaPath, []string{"runtimeException"}},
+	}
+
+	channelID := util.GetTestChainID()
+
+	for _, tc := range testCases {
+		t.Run(tc.name+"_"+tc.chaincodeType.String(), func(t *testing.T) {
+
+			if tc.chaincodeType == pb.ChaincodeSpec_JAVA && runtime.GOARCH != "amd64" {
+				t.Skip("No Java chaincode support yet on non-x86_64.")
+			}
+
+			// initialize peer
+			if listener, err := initPeer(channelID); err != nil {
+				t.Errorf("Error creating peer: %s", err)
+			} else {
+				defer finitPeer(listener, channelID)
+			}
+
+			var nextBlockNumber uint64
+
+			// the chaincode to install and instanciate
+			chaincodeName := generateChaincodeName(tc.chaincodeType)
+			chaincodePath := tc.chaincodePath
+			chaincodeVersion := "1.0.0.0"
+			chaincodeType := tc.chaincodeType
+			chaincodeDeployArgs := util.ArrayToChaincodeArgs(tc.args)
+
+			// new chaincode context for passing around parameters
+			chaincodeCtx := ccprovider.NewCCContext(channelID, chaincodeName, chaincodeVersion, "", false, nil, nil)
+
+			// attempt to deploy chaincode
+			_, err := deployChaincode(context.Background(), chaincodeCtx, chaincodeType, chaincodePath, chaincodeDeployArgs, nextBlockNumber)
+
+			// deploy should of failed
+			if err == nil {
+				t.Fatal("Deployment should have failed.")
+			}
+			t.Log(err)
+
+		})
+	}
+}
 
 func TestMain(m *testing.M) {
 	var err error
 
-	// setup the MSP manager so that we can sign/verify
-	mspMgrConfigDir := "../../msp/sampleconfig/"
-	mspmgmt.LoadFakeSetupWithLocalMspAndTestChainMsp(mspMgrConfigDir)
+	msptesttools.LoadMSPSetupForTesting()
 	signer, err = mspmgmt.GetLocalMSP().GetDefaultSigningIdentity()
 	if err != nil {
 		os.Exit(-1)
-		fmt.Printf("Could not initialize msp/signer")
+		fmt.Print("Could not initialize msp/signer")
 		return
 	}
 
 	SetupTestConfig()
 	os.Exit(m.Run())
+}
+
+func deployChaincode(ctx context.Context, chaincodeCtx *ccprovider.CCContext, chaincodeType pb.ChaincodeSpec_Type, path string, args [][]byte, nextBlockNumber uint64) ([]byte, error) {
+
+	chaincodeSpec := &pb.ChaincodeSpec{
+		ChaincodeId: &pb.ChaincodeID{
+			Name:    chaincodeCtx.Name,
+			Version: chaincodeCtx.Version,
+			Path:    path,
+		},
+		Type: chaincodeType,
+		Input: &pb.ChaincodeInput{
+			Args: args,
+		},
+	}
+
+	result, err := deploy(ctx, chaincodeCtx, chaincodeSpec, nextBlockNumber)
+	if err != nil {
+		return nil, fmt.Errorf("Error deploying <%s:%s>: %s", chaincodeSpec.ChaincodeId.Name, chaincodeSpec.ChaincodeId.Version, err)
+	}
+	return result, nil
+}
+
+var signer msp.SigningIdentity
+
+var rng *rand.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func generateChaincodeName(chaincodeType pb.ChaincodeSpec_Type) string {
+	prefix := "cc_"
+	switch chaincodeType {
+	case pb.ChaincodeSpec_GOLANG:
+		prefix = "cc_go_"
+	case pb.ChaincodeSpec_JAVA:
+		prefix = "cc_java_"
+	case pb.ChaincodeSpec_NODE:
+		prefix = "cc_js_"
+	}
+	return fmt.Sprintf("%s%06d", prefix, rng.Intn(999999))
+}
+
+type CreatorPolicy struct {
+	Creators [][]byte
+}
+
+// Evaluate takes a set of SignedData and evaluates whether this set of signatures satisfies the policy
+func (c *CreatorPolicy) Evaluate(signatureSet []*common.SignedData) error {
+	for _, value := range c.Creators {
+		if bytes.Compare(signatureSet[0].Identity, value) == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("Creator not recognized [%s]", string(signatureSet[0].Identity))
+}
+
+type mockPolicyCheckerFactory struct{}
+
+func (f *mockPolicyCheckerFactory) NewPolicyChecker() policy.PolicyChecker {
+	return policy.NewPolicyChecker(
+		peer.NewChannelPolicyManagerGetter(),
+		&policy.MockIdentityDeserializer{[]byte("Admin"), []byte("msg1")},
+		&policy.MockMSPPrincipalGetter{Principal: []byte("Admin")},
+	)
 }

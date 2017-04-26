@@ -19,11 +19,16 @@ package events
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"runtime"
 	"strings"
 
 	"github.com/op/go-logging"
 	"github.com/spf13/viper"
+
+	"github.com/hyperledger/fabric/bccsp/factory"
+	"github.com/hyperledger/fabric/core/config"
+	"github.com/hyperledger/fabric/msp"
 )
 
 // Config the config wrapper structure
@@ -55,13 +60,31 @@ func SetupTestConfig() {
 	viper.AutomaticEnv()
 	replacer := strings.NewReplacer(".", "_")
 	viper.SetEnvKeyReplacer(replacer)
-	viper.SetConfigName("core")       // name of config file (without extension)
-	viper.AddConfigPath("./")         // path to look for the config file in
-	viper.AddConfigPath("./../peer/") // path to look for the config file in
-	err := viper.ReadInConfig()       // Find and read the config file
-	if err != nil {                   // Handle errors reading the config file
+	viper.SetConfigName("core")  // name of config file (without extension)
+	config.AddDevConfigPath(nil) // path to look for the config file in
+	err := viper.ReadInConfig()  // Find and read the config file
+	if err != nil {              // Handle errors reading the config file
 		panic(fmt.Errorf("Fatal error config file: %s \n", err))
 	}
 
 	SetupTestLogging()
+
+	// Init the BCCSP
+	var bccspConfig *factory.FactoryOpts
+	err = viper.UnmarshalKey("peer.BCCSP", &bccspConfig)
+	if err != nil {
+		bccspConfig = nil
+	}
+
+	tmpKeyStore, err := ioutil.TempDir("/tmp", "msp-keystore")
+	if err != nil {
+		panic(fmt.Errorf("Could not create temporary directory: %s\n", tmpKeyStore))
+	}
+
+	msp.SetupBCCSPKeystoreConfig(bccspConfig, tmpKeyStore)
+
+	err = factory.InitFactories(bccspConfig)
+	if err != nil {
+		panic(fmt.Errorf("Could not initialize BCCSP Factories [%s]", err))
+	}
 }

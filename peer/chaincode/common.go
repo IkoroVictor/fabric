@@ -24,7 +24,6 @@ import (
 	"strings"
 
 	"github.com/hyperledger/fabric/common/cauthdsl"
-	cutil "github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/core/chaincode"
 	"github.com/hyperledger/fabric/core/chaincode/platforms"
 	"github.com/hyperledger/fabric/core/container"
@@ -52,10 +51,10 @@ func checkSpec(spec *pb.ChaincodeSpec) error {
 	return platform.ValidateSpec(spec)
 }
 
-// getChaincodeBytes get chaincode deployment spec given the chaincode spec
-func getChaincodeBytes(spec *pb.ChaincodeSpec) (*pb.ChaincodeDeploymentSpec, error) {
+// getChaincodeDeploymentSpec get chaincode deployment spec given the chaincode spec
+func getChaincodeDeploymentSpec(spec *pb.ChaincodeSpec, crtPkg bool) (*pb.ChaincodeDeploymentSpec, error) {
 	var codePackageBytes []byte
-	if chaincode.IsDevMode() == false {
+	if chaincode.IsDevMode() == false && crtPkg {
 		var err error
 		if err = checkSpec(spec); err != nil {
 			return nil, err
@@ -71,7 +70,8 @@ func getChaincodeBytes(spec *pb.ChaincodeSpec) (*pb.ChaincodeDeploymentSpec, err
 	return chaincodeDeploymentSpec, nil
 }
 
-func getChaincodeSpecification(cmd *cobra.Command) (*pb.ChaincodeSpec, error) {
+// getChaincodeSpec get chaincode spec from the cli cmd pramameters
+func getChaincodeSpec(cmd *cobra.Command) (*pb.ChaincodeSpec, error) {
 	spec := &pb.ChaincodeSpec{}
 	if err := checkChaincodeCmdParams(cmd); err != nil {
 		return spec, err
@@ -86,14 +86,14 @@ func getChaincodeSpecification(cmd *cobra.Command) (*pb.ChaincodeSpec, error) {
 	chaincodeLang = strings.ToUpper(chaincodeLang)
 	spec = &pb.ChaincodeSpec{
 		Type:        pb.ChaincodeSpec_Type(pb.ChaincodeSpec_Type_value[chaincodeLang]),
-		ChaincodeID: &pb.ChaincodeID{Path: chaincodePath, Name: chaincodeName},
+		ChaincodeId: &pb.ChaincodeID{Path: chaincodePath, Name: chaincodeName, Version: chaincodeVersion},
 		Input:       input,
 	}
 	return spec, nil
 }
 
 func chaincodeInvokeOrQuery(cmd *cobra.Command, args []string, invoke bool, cf *ChaincodeCmdFactory) (err error) {
-	spec, err := getChaincodeSpecification(cmd)
+	spec, err := getChaincodeSpec(cmd)
 	if err != nil {
 		return err
 	}
@@ -107,12 +107,12 @@ func chaincodeInvokeOrQuery(cmd *cobra.Command, args []string, invoke bool, cf *
 		logger.Infof("Invoke result: %v", proposalResp)
 	} else {
 		if proposalResp == nil {
-			return fmt.Errorf("Error query %s by endorsing: %s\n", chainFuncName, err)
+			return fmt.Errorf("Error query %s by endorsing: %s", chainFuncName, err)
 		}
 
 		if chaincodeQueryRaw {
 			if chaincodeQueryHex {
-				err = errors.New("Options --raw (-r) and --hex (-x) are not compatible\n")
+				err = errors.New("Options --raw (-r) and --hex (-x) are not compatible")
 				return
 			}
 			fmt.Print("Query Result (Raw): ")
@@ -131,46 +131,48 @@ func chaincodeInvokeOrQuery(cmd *cobra.Command, args []string, invoke bool, cf *
 func checkChaincodeCmdParams(cmd *cobra.Command) error {
 	//we need chaincode name for everything, including deploy
 	if chaincodeName == common.UndefinedParamValue {
-		return fmt.Errorf("Must supply value for %s name parameter.\n", chainFuncName)
+		return fmt.Errorf("Must supply value for %s name parameter.", chainFuncName)
+	}
+
+	if cmd.Name() == instantiate_cmdname || cmd.Name() == install_cmdname || cmd.Name() == upgrade_cmdname || cmd.Name() == package_cmdname {
+		if chaincodeVersion == common.UndefinedParamValue {
+			return fmt.Errorf("Chaincode version is not provided for %s", cmd.Name())
+		}
 	}
 
 	// if it's not a deploy or an upgrade we don't need policy, escc and vscc
-	if cmd.Name() != deploy_cmdname && cmd.Name() != upgrade_cmdname {
+	if cmd.Name() != instantiate_cmdname && cmd.Name() != upgrade_cmdname {
 		if escc != common.UndefinedParamValue {
-			return fmt.Errorf("escc should be supplied only to chaincode deploy requests")
+			return errors.New("escc should be supplied only to chaincode deploy requests")
 		}
 
 		if vscc != common.UndefinedParamValue {
-			return fmt.Errorf("vscc should be supplied only to chaincode deploy requests")
+			return errors.New("vscc should be supplied only to chaincode deploy requests")
 		}
 
 		if policy != common.UndefinedParamValue {
-			return fmt.Errorf("policy should be supplied only to chaincode deploy requests")
+			return errors.New("policy should be supplied only to chaincode deploy requests")
 		}
 	} else {
 		if escc != common.UndefinedParamValue {
 			logger.Infof("Using escc %s", escc)
 		} else {
-			logger.Infof("Using default escc")
+			logger.Info("Using default escc")
 			escc = "escc"
 		}
 
 		if vscc != common.UndefinedParamValue {
 			logger.Infof("Using vscc %s", vscc)
 		} else {
-			logger.Infof("Using default vscc")
+			logger.Info("Using default vscc")
 			vscc = "vscc"
 		}
 
 		if policy != common.UndefinedParamValue {
 			p, err := cauthdsl.FromString(policy)
 			if err != nil {
-				return fmt.Errorf("Invalid policy %s\n", policy)
+				return fmt.Errorf("Invalid policy %s", policy)
 			}
-			policyMarhsalled = putils.MarshalOrPanic(p)
-		} else {
-			// FIXME: we need to get the default from somewhere
-			p := cauthdsl.SignedByMspMember("DEFAULT")
 			policyMarhsalled = putils.MarshalOrPanic(p)
 		}
 	}
@@ -194,10 +196,12 @@ func checkChaincodeCmdParams(cmd *cobra.Command) error {
 		_, argsPresent := sm["args"]
 		_, funcPresent := sm["function"]
 		if !argsPresent || (len(m) == 2 && !funcPresent) || len(m) > 2 {
-			return fmt.Errorf("Non-empty JSON chaincode parameters must contain the following keys: 'Args' or 'Function' and 'Args'")
+			return errors.New("Non-empty JSON chaincode parameters must contain the following keys: 'Args' or 'Function' and 'Args'")
 		}
 	} else {
-		return errors.New("Empty JSON chaincode parameters must contain the following keys: 'Args' or 'Function' and 'Args'")
+		if cmd == nil || (cmd != chaincodeInstallCmd && cmd != chaincodePackageCmd) {
+			return errors.New("Empty JSON chaincode parameters must contain the following keys: 'Args' or 'Function' and 'Args'")
+		}
 	}
 
 	return nil
@@ -211,10 +215,14 @@ type ChaincodeCmdFactory struct {
 }
 
 // InitCmdFactory init the ChaincodeCmdFactory with default clients
-func InitCmdFactory() (*ChaincodeCmdFactory, error) {
-	endorserClient, err := common.GetEndorserClient()
-	if err != nil {
-		return nil, fmt.Errorf("Error getting endorser client %s: %s", chainFuncName, err)
+func InitCmdFactory(isEndorserRequired, isOrdererRequired bool) (*ChaincodeCmdFactory, error) {
+	var err error
+	var endorserClient pb.EndorserClient
+	if isEndorserRequired {
+		endorserClient, err = common.GetEndorserClient()
+		if err != nil {
+			return nil, fmt.Errorf("Error getting endorser client %s: %s", chainFuncName, err)
+		}
 	}
 
 	signer, err := common.GetDefaultSigner()
@@ -222,11 +230,14 @@ func InitCmdFactory() (*ChaincodeCmdFactory, error) {
 		return nil, fmt.Errorf("Error getting default signer: %s", err)
 	}
 
-	broadcastClient, err := common.GetBroadcastClient()
-	if err != nil {
-		return nil, fmt.Errorf("Error getting broadcast client: %s", err)
-	}
+	var broadcastClient common.BroadcastClient
+	if isOrdererRequired {
+		broadcastClient, err = common.GetBroadcastClient(orderingEndpoint, tls, caFile)
 
+		if err != nil {
+			return nil, fmt.Errorf("Error getting broadcast client: %s", err)
+		}
+	}
 	return &ChaincodeCmdFactory{
 		EndorserClient:  endorserClient,
 		Signer:          signer,
@@ -255,15 +266,13 @@ func ChaincodeInvokeOrQuery(spec *pb.ChaincodeSpec, cID string, invoke bool, sig
 		return nil, fmt.Errorf("Error serializing identity for %s: %s", signer.GetIdentifier(), err)
 	}
 
-	uuid := cutil.GenerateUUID()
-
 	funcName := "invoke"
 	if !invoke {
 		funcName = "query"
 	}
 
 	var prop *pb.Proposal
-	prop, err = putils.CreateProposalFromCIS(uuid, pcommon.HeaderType_ENDORSER_TRANSACTION, cID, invocation, creator)
+	prop, _, err = putils.CreateProposalFromCIS(pcommon.HeaderType_ENDORSER_TRANSACTION, cID, invocation, creator)
 	if err != nil {
 		return nil, fmt.Errorf("Error creating proposal  %s: %s", funcName, err)
 	}

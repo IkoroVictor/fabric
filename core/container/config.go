@@ -24,6 +24,10 @@ import (
 
 	"github.com/op/go-logging"
 	"github.com/spf13/viper"
+
+	"github.com/hyperledger/fabric/bccsp/factory"
+	"github.com/hyperledger/fabric/core/config"
+	"github.com/hyperledger/fabric/msp"
 )
 
 // Config the config wrapper structure
@@ -59,11 +63,10 @@ func SetupTestConfig() {
 	viper.AutomaticEnv()
 	replacer := strings.NewReplacer(".", "_")
 	viper.SetEnvKeyReplacer(replacer)
-	viper.SetConfigName("core")          // name of config file (without extension)
-	viper.AddConfigPath("./")            // path to look for the config file in
-	viper.AddConfigPath("./../../peer/") // path to look for the config file in
-	err := viper.ReadInConfig()          // Find and read the config file
-	if err != nil {                      // Handle errors reading the config file
+	viper.SetConfigName("core")  // name of config file (without extension)
+	config.AddDevConfigPath(nil) // path to look for the config file in
+	err := viper.ReadInConfig()  // Find and read the config file
+	if err != nil {              // Handle errors reading the config file
 		panic(fmt.Errorf("Fatal error config file: %s \n", err))
 	}
 
@@ -73,4 +76,17 @@ func SetupTestConfig() {
 	var numProcsDesired = viper.GetInt("peer.gomaxprocs")
 	vmLogger.Debugf("setting Number of procs to %d, was %d\n", numProcsDesired, runtime.GOMAXPROCS(2))
 
+	// Init the BCCSP
+	var bccspConfig *factory.FactoryOpts
+	err = viper.UnmarshalKey("peer.BCCSP", &bccspConfig)
+	if err != nil {
+		bccspConfig = nil
+	}
+
+	msp.SetupBCCSPKeystoreConfig(bccspConfig, viper.GetString("peer.mspConfigPath")+"/keystore")
+
+	err = factory.InitFactories(bccspConfig)
+	if err != nil {
+		panic(fmt.Errorf("Could not initialize BCCSP Factories [%s]", err))
+	}
 }

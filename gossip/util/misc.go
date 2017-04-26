@@ -17,19 +17,21 @@ limitations under the License.
 package util
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
+	"io"
+	"math/big"
 	"math/rand"
 	"reflect"
 	"runtime"
 	"sync"
+	"time"
+
+	"github.com/spf13/viper"
 )
 
 // Equals returns whether a and b are the same
 type Equals func(a interface{}, b interface{}) bool
-
-func init() {
-	rand.Seed(42)
-}
 
 // IndexInSlice returns the index of given object o in array
 func IndexInSlice(array interface{}, o interface{}, equals Equals) int {
@@ -62,21 +64,13 @@ func GetRandomIndices(indiceCount, highestIndex int) []int {
 	}
 
 	for len(indices) < indiceCount {
-		n := rand.Intn(highestIndex + 1)
+		n := RandomInt(highestIndex + 1)
 		if IndexInSlice(indices, n, numbericEqual) != -1 {
 			continue
 		}
 		indices = append(indices, n)
 	}
 	return indices
-}
-
-// Abs returns abs(a-b)
-func Abs(a, b uint64) uint64 {
-	if a > b {
-		return a - b
-	}
-	return b - a
 }
 
 // Set is a generic and thread-safe
@@ -145,4 +139,47 @@ func PrintStackTrace() {
 	buf := make([]byte, 1<<16)
 	runtime.Stack(buf, true)
 	fmt.Printf("%s", buf)
+}
+
+// GetIntOrDefault returns the int value from config if present otherwise default value
+func GetIntOrDefault(key string, defVal int) int {
+	if val := viper.GetInt(key); val != 0 {
+		return val
+	}
+
+	return defVal
+}
+
+// GetDurationOrDefault returns the Duration value from config if present otherwise default value
+func GetDurationOrDefault(key string, defVal time.Duration) time.Duration {
+	if val := viper.GetDuration(key); val != 0 {
+		return val
+	}
+
+	return defVal
+}
+
+// RandomInt returns, as an int, a non-negative pseudo-random integer in [0,n)
+// It panics if n <= 0
+func RandomInt(n int) int {
+	if n <= 0 {
+		panic(fmt.Sprintf("Got invalid (non positive) value: %d", n))
+	}
+	m := int(RandomUInt64()) % n
+	if m < 0 {
+		return n + m
+	}
+	return m
+}
+
+// RandomUInt64 returns a random uint64
+func RandomUInt64() uint64 {
+	b := make([]byte, 8)
+	_, err := io.ReadFull(cryptorand.Reader, b)
+	if err == nil {
+		n := new(big.Int)
+		return n.SetBytes(b).Uint64()
+	}
+	rand.Seed(rand.Int63())
+	return uint64(rand.Int63())
 }

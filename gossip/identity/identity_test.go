@@ -18,20 +18,30 @@ package identity
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/common"
+	"github.com/hyperledger/fabric/gossip/util"
 	"github.com/stretchr/testify/assert"
 )
 
-var msgCryptoService = &naiveCryptoService{}
+var msgCryptoService = &naiveCryptoService{revokedIdentities: map[string]struct{}{}}
 
 type naiveCryptoService struct {
+	revokedIdentities map[string]struct{}
 }
 
-func (*naiveCryptoService) ValidateIdentity(peerIdentity api.PeerIdentityType) error {
+func init() {
+	util.SetupTestLogging()
+}
+
+func (cs *naiveCryptoService) ValidateIdentity(peerIdentity api.PeerIdentityType) error {
+	if _, isRevoked := cs.revokedIdentities[string(cs.GetPKIidOfCert(peerIdentity))]; isRevoked {
+		return errors.New("revoked")
+	}
 	return nil
 }
 
@@ -42,7 +52,7 @@ func (*naiveCryptoService) GetPKIidOfCert(peerIdentity api.PeerIdentityType) com
 
 // VerifyBlock returns nil if the block is properly signed,
 // else returns error
-func (*naiveCryptoService) VerifyBlock(chainID common.ChainID, signedBlock api.SignedBlock) error {
+func (*naiveCryptoService) VerifyBlock(chainID common.ChainID, signedBlock []byte) error {
 	return nil
 }
 
@@ -108,4 +118,22 @@ func TestVerify(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NoError(t, idStore.Verify(pkiID, signed, []byte("bla bla")))
 	assert.Error(t, idStore.Verify(pkiID2, signed, []byte("bla bla")))
+}
+
+func TestListRevokedPeers(t *testing.T) {
+	idStore := NewIdentityMapper(msgCryptoService)
+	identity := []byte("yacovm")
+	pkiID := msgCryptoService.GetPKIidOfCert(api.PeerIdentityType(identity))
+	assert.NoError(t, idStore.Put(pkiID, api.PeerIdentityType(identity)))
+	cert, err := idStore.Get(pkiID)
+	assert.NoError(t, err)
+	assert.NotNil(t, cert)
+	// Revoke the certificate
+	msgCryptoService.revokedIdentities[string(pkiID)] = struct{}{}
+	idStore.ListRevokedPeers(func(_ api.PeerIdentityType) bool {
+		return true
+	})
+	cert, err = idStore.Get(pkiID)
+	assert.Error(t, err)
+	assert.Nil(t, cert)
 }

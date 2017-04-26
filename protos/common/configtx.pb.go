@@ -13,181 +13,302 @@ var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
 
-type ConfigurationItem_ConfigurationType int32
-
-const (
-	ConfigurationItem_Policy  ConfigurationItem_ConfigurationType = 0
-	ConfigurationItem_Chain   ConfigurationItem_ConfigurationType = 1
-	ConfigurationItem_Orderer ConfigurationItem_ConfigurationType = 2
-	ConfigurationItem_Peer    ConfigurationItem_ConfigurationType = 3
-	ConfigurationItem_MSP     ConfigurationItem_ConfigurationType = 4
-)
-
-var ConfigurationItem_ConfigurationType_name = map[int32]string{
-	0: "Policy",
-	1: "Chain",
-	2: "Orderer",
-	3: "Peer",
-	4: "MSP",
-}
-var ConfigurationItem_ConfigurationType_value = map[string]int32{
-	"Policy":  0,
-	"Chain":   1,
-	"Orderer": 2,
-	"Peer":    3,
-	"MSP":     4,
-}
-
-func (x ConfigurationItem_ConfigurationType) String() string {
-	return proto.EnumName(ConfigurationItem_ConfigurationType_name, int32(x))
-}
-func (ConfigurationItem_ConfigurationType) EnumDescriptor() ([]byte, []int) {
-	return fileDescriptor1, []int{3, 0}
-}
-
-// ConfigurationEnvelope is designed to contain _all_ configuration for a chain with no dependency
+// ConfigEnvelope is designed to contain _all_ configuration for a chain with no dependency
 // on previous configuration transactions.
 //
 // It is generated with the following scheme:
 //   1. Retrieve the existing configuration
-//   2. Note the highest configuration sequence number, store it and increment it by one
-//   3. Modify desired ConfigurationItems, setting each LastModified to the stored and incremented sequence number
-//     a) Note that the ConfigurationItem has a ChainHeader header attached to it, who's type is set to CONFIGURATION_ITEM
-//   4. Update SignedConfigurationItem with appropriate signatures over the modified ConfigurationItem
-//     a) Each signature is of type ConfigurationSignature
-//     b) The ConfigurationSignature signature is over the concatenation of signatureHeader and the ConfigurationItem bytes (which includes a ChainHeader)
-//   5. Submit new Configuration for ordering in Envelope signed by submitter
-//     a) The Envelope Payload has data set to the marshaled ConfigurationEnvelope
-//     b) The Envelope Payload has a header of type Header.Type.CONFIGURATION_TRANSACTION
+//   2. Note the config properties (ConfigValue, ConfigPolicy, ConfigGroup) to be modified
+//   3. Add any intermediate ConfigGroups to the ConfigUpdate.read_set (sparsely)
+//   4. Add any additional desired dependencies to ConfigUpdate.read_set (sparsely)
+//   5. Modify the config properties, incrementing each version by 1, set them in the ConfigUpdate.write_set
+//      Note: any element not modified but specified should already be in the read_set, so may be specified sparsely
+//   6. Create ConfigUpdate message and marshal it into ConfigUpdateEnvelope.update and encode the required signatures
+//     a) Each signature is of type ConfigSignature
+//     b) The ConfigSignature signature is over the concatenation of signature_header and the ConfigUpdate bytes (which includes a ChainHeader)
+//   5. Submit new Config for ordering in Envelope signed by submitter
+//     a) The Envelope Payload has data set to the marshaled ConfigEnvelope
+//     b) The Envelope Payload has a header of type Header.Type.CONFIG_UPDATE
 //
 // The configuration manager will verify:
-//   1. All configuration items and the envelope refer to the correct chain
-//   2. Some configuration item has been added or modified
-//   3. No existing configuration item has been ommitted
-//   4. All configuration changes have a LastModification of one more than the last configuration's highest LastModification number
-//   5. All configuration changes satisfy the corresponding modification policy
-type ConfigurationEnvelope struct {
-	Items []*SignedConfigurationItem `protobuf:"bytes,1,rep,name=Items" json:"Items,omitempty"`
+//   1. All items in the read_set exist at the read versions
+//   2. All items in the write_set at a different version than, or not in, the read_set have been appropriately signed according to their mod_policy
+//   3. The new configuration satisfies the ConfigSchema
+type ConfigEnvelope struct {
+	Config     *Config   `protobuf:"bytes,1,opt,name=config" json:"config,omitempty"`
+	LastUpdate *Envelope `protobuf:"bytes,2,opt,name=last_update,json=lastUpdate" json:"last_update,omitempty"`
 }
 
-func (m *ConfigurationEnvelope) Reset()                    { *m = ConfigurationEnvelope{} }
-func (m *ConfigurationEnvelope) String() string            { return proto.CompactTextString(m) }
-func (*ConfigurationEnvelope) ProtoMessage()               {}
-func (*ConfigurationEnvelope) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{0} }
+func (m *ConfigEnvelope) Reset()                    { *m = ConfigEnvelope{} }
+func (m *ConfigEnvelope) String() string            { return proto.CompactTextString(m) }
+func (*ConfigEnvelope) ProtoMessage()               {}
+func (*ConfigEnvelope) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{0} }
 
-func (m *ConfigurationEnvelope) GetItems() []*SignedConfigurationItem {
+func (m *ConfigEnvelope) GetConfig() *Config {
 	if m != nil {
-		return m.Items
+		return m.Config
 	}
 	return nil
 }
 
-// ConfigurationTemplate is used as a serialization format to share configuration templates
-// The orderer supplies a configuration template to the user to use when constructing a new
-// chain creation transaction, so this is used to facilitate that.
-type ConfigurationTemplate struct {
-	Items []*ConfigurationItem `protobuf:"bytes,1,rep,name=Items" json:"Items,omitempty"`
-}
-
-func (m *ConfigurationTemplate) Reset()                    { *m = ConfigurationTemplate{} }
-func (m *ConfigurationTemplate) String() string            { return proto.CompactTextString(m) }
-func (*ConfigurationTemplate) ProtoMessage()               {}
-func (*ConfigurationTemplate) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{1} }
-
-func (m *ConfigurationTemplate) GetItems() []*ConfigurationItem {
+func (m *ConfigEnvelope) GetLastUpdate() *Envelope {
 	if m != nil {
-		return m.Items
+		return m.LastUpdate
 	}
 	return nil
 }
 
-// This message may change slightly depending on the finalization of signature schemes for transactions
-type SignedConfigurationItem struct {
-	ConfigurationItem []byte                    `protobuf:"bytes,1,opt,name=ConfigurationItem,proto3" json:"ConfigurationItem,omitempty"`
-	Signatures        []*ConfigurationSignature `protobuf:"bytes,2,rep,name=Signatures" json:"Signatures,omitempty"`
+type ConfigGroupSchema struct {
+	Groups   map[string]*ConfigGroupSchema  `protobuf:"bytes,1,rep,name=groups" json:"groups,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Values   map[string]*ConfigValueSchema  `protobuf:"bytes,2,rep,name=values" json:"values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Policies map[string]*ConfigPolicySchema `protobuf:"bytes,3,rep,name=policies" json:"policies,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 }
 
-func (m *SignedConfigurationItem) Reset()                    { *m = SignedConfigurationItem{} }
-func (m *SignedConfigurationItem) String() string            { return proto.CompactTextString(m) }
-func (*SignedConfigurationItem) ProtoMessage()               {}
-func (*SignedConfigurationItem) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{2} }
+func (m *ConfigGroupSchema) Reset()                    { *m = ConfigGroupSchema{} }
+func (m *ConfigGroupSchema) String() string            { return proto.CompactTextString(m) }
+func (*ConfigGroupSchema) ProtoMessage()               {}
+func (*ConfigGroupSchema) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{1} }
 
-func (m *SignedConfigurationItem) GetSignatures() []*ConfigurationSignature {
+func (m *ConfigGroupSchema) GetGroups() map[string]*ConfigGroupSchema {
+	if m != nil {
+		return m.Groups
+	}
+	return nil
+}
+
+func (m *ConfigGroupSchema) GetValues() map[string]*ConfigValueSchema {
+	if m != nil {
+		return m.Values
+	}
+	return nil
+}
+
+func (m *ConfigGroupSchema) GetPolicies() map[string]*ConfigPolicySchema {
+	if m != nil {
+		return m.Policies
+	}
+	return nil
+}
+
+type ConfigValueSchema struct {
+}
+
+func (m *ConfigValueSchema) Reset()                    { *m = ConfigValueSchema{} }
+func (m *ConfigValueSchema) String() string            { return proto.CompactTextString(m) }
+func (*ConfigValueSchema) ProtoMessage()               {}
+func (*ConfigValueSchema) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{2} }
+
+type ConfigPolicySchema struct {
+}
+
+func (m *ConfigPolicySchema) Reset()                    { *m = ConfigPolicySchema{} }
+func (m *ConfigPolicySchema) String() string            { return proto.CompactTextString(m) }
+func (*ConfigPolicySchema) ProtoMessage()               {}
+func (*ConfigPolicySchema) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{3} }
+
+// Config represents the config for a particular channel
+type Config struct {
+	Sequence     uint64       `protobuf:"varint,1,opt,name=sequence" json:"sequence,omitempty"`
+	ChannelGroup *ConfigGroup `protobuf:"bytes,2,opt,name=channel_group,json=channelGroup" json:"channel_group,omitempty"`
+}
+
+func (m *Config) Reset()                    { *m = Config{} }
+func (m *Config) String() string            { return proto.CompactTextString(m) }
+func (*Config) ProtoMessage()               {}
+func (*Config) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{4} }
+
+func (m *Config) GetChannelGroup() *ConfigGroup {
+	if m != nil {
+		return m.ChannelGroup
+	}
+	return nil
+}
+
+type ConfigUpdateEnvelope struct {
+	ConfigUpdate []byte             `protobuf:"bytes,1,opt,name=config_update,json=configUpdate,proto3" json:"config_update,omitempty"`
+	Signatures   []*ConfigSignature `protobuf:"bytes,2,rep,name=signatures" json:"signatures,omitempty"`
+}
+
+func (m *ConfigUpdateEnvelope) Reset()                    { *m = ConfigUpdateEnvelope{} }
+func (m *ConfigUpdateEnvelope) String() string            { return proto.CompactTextString(m) }
+func (*ConfigUpdateEnvelope) ProtoMessage()               {}
+func (*ConfigUpdateEnvelope) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{5} }
+
+func (m *ConfigUpdateEnvelope) GetSignatures() []*ConfigSignature {
 	if m != nil {
 		return m.Signatures
 	}
 	return nil
 }
 
-type ConfigurationItem struct {
-	Header             *ChainHeader                        `protobuf:"bytes,1,opt,name=Header" json:"Header,omitempty"`
-	Type               ConfigurationItem_ConfigurationType `protobuf:"varint,2,opt,name=Type,enum=common.ConfigurationItem_ConfigurationType" json:"Type,omitempty"`
-	LastModified       uint64                              `protobuf:"varint,3,opt,name=LastModified" json:"LastModified,omitempty"`
-	ModificationPolicy string                              `protobuf:"bytes,4,opt,name=ModificationPolicy" json:"ModificationPolicy,omitempty"`
-	Key                string                              `protobuf:"bytes,5,opt,name=Key" json:"Key,omitempty"`
-	Value              []byte                              `protobuf:"bytes,6,opt,name=Value,proto3" json:"Value,omitempty"`
+// ConfigUpdate is used to submit a subset of config and to have the orderer apply to Config
+// it is always submitted inside a ConfigUpdateEnvelope which allows the addition of signatures
+// resulting in a new total configuration.  The update is applied as follows:
+// 1. The versions from all of the elements in the read_set is verified against the versions in the existing config.
+//    If there is a mismatch in the read versions, then the config update fails and is rejected.
+// 2. Any elements in the write_set with the same version as the read_set are ignored.
+// 3. The corresponding mod_policy for every remaining element in the write_set is collected.
+// 4. Each policy is checked against the signatures from the ConfigUpdateEnvelope, any failing to verify are rejected
+// 5. The write_set is applied to the Config and the ConfigGroupSchema verifies that the updates were legal
+type ConfigUpdate struct {
+	ChannelId string       `protobuf:"bytes,1,opt,name=channel_id,json=channelId" json:"channel_id,omitempty"`
+	ReadSet   *ConfigGroup `protobuf:"bytes,2,opt,name=read_set,json=readSet" json:"read_set,omitempty"`
+	WriteSet  *ConfigGroup `protobuf:"bytes,3,opt,name=write_set,json=writeSet" json:"write_set,omitempty"`
 }
 
-func (m *ConfigurationItem) Reset()                    { *m = ConfigurationItem{} }
-func (m *ConfigurationItem) String() string            { return proto.CompactTextString(m) }
-func (*ConfigurationItem) ProtoMessage()               {}
-func (*ConfigurationItem) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{3} }
+func (m *ConfigUpdate) Reset()                    { *m = ConfigUpdate{} }
+func (m *ConfigUpdate) String() string            { return proto.CompactTextString(m) }
+func (*ConfigUpdate) ProtoMessage()               {}
+func (*ConfigUpdate) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{6} }
 
-func (m *ConfigurationItem) GetHeader() *ChainHeader {
+func (m *ConfigUpdate) GetReadSet() *ConfigGroup {
 	if m != nil {
-		return m.Header
+		return m.ReadSet
 	}
 	return nil
 }
 
-type ConfigurationSignature struct {
-	SignatureHeader []byte `protobuf:"bytes,1,opt,name=signatureHeader,proto3" json:"signatureHeader,omitempty"`
+func (m *ConfigUpdate) GetWriteSet() *ConfigGroup {
+	if m != nil {
+		return m.WriteSet
+	}
+	return nil
+}
+
+// ConfigGroup is the hierarchical data structure for holding config
+type ConfigGroup struct {
+	Version   uint64                   `protobuf:"varint,1,opt,name=version" json:"version,omitempty"`
+	Groups    map[string]*ConfigGroup  `protobuf:"bytes,2,rep,name=groups" json:"groups,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Values    map[string]*ConfigValue  `protobuf:"bytes,3,rep,name=values" json:"values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Policies  map[string]*ConfigPolicy `protobuf:"bytes,4,rep,name=policies" json:"policies,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ModPolicy string                   `protobuf:"bytes,5,opt,name=mod_policy,json=modPolicy" json:"mod_policy,omitempty"`
+}
+
+func (m *ConfigGroup) Reset()                    { *m = ConfigGroup{} }
+func (m *ConfigGroup) String() string            { return proto.CompactTextString(m) }
+func (*ConfigGroup) ProtoMessage()               {}
+func (*ConfigGroup) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{7} }
+
+func (m *ConfigGroup) GetGroups() map[string]*ConfigGroup {
+	if m != nil {
+		return m.Groups
+	}
+	return nil
+}
+
+func (m *ConfigGroup) GetValues() map[string]*ConfigValue {
+	if m != nil {
+		return m.Values
+	}
+	return nil
+}
+
+func (m *ConfigGroup) GetPolicies() map[string]*ConfigPolicy {
+	if m != nil {
+		return m.Policies
+	}
+	return nil
+}
+
+// ConfigValue represents an individual piece of config data
+type ConfigValue struct {
+	Version   uint64 `protobuf:"varint,1,opt,name=version" json:"version,omitempty"`
+	Value     []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	ModPolicy string `protobuf:"bytes,3,opt,name=mod_policy,json=modPolicy" json:"mod_policy,omitempty"`
+}
+
+func (m *ConfigValue) Reset()                    { *m = ConfigValue{} }
+func (m *ConfigValue) String() string            { return proto.CompactTextString(m) }
+func (*ConfigValue) ProtoMessage()               {}
+func (*ConfigValue) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{8} }
+
+type ConfigPolicy struct {
+	Version   uint64  `protobuf:"varint,1,opt,name=version" json:"version,omitempty"`
+	Policy    *Policy `protobuf:"bytes,2,opt,name=policy" json:"policy,omitempty"`
+	ModPolicy string  `protobuf:"bytes,3,opt,name=mod_policy,json=modPolicy" json:"mod_policy,omitempty"`
+}
+
+func (m *ConfigPolicy) Reset()                    { *m = ConfigPolicy{} }
+func (m *ConfigPolicy) String() string            { return proto.CompactTextString(m) }
+func (*ConfigPolicy) ProtoMessage()               {}
+func (*ConfigPolicy) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{9} }
+
+func (m *ConfigPolicy) GetPolicy() *Policy {
+	if m != nil {
+		return m.Policy
+	}
+	return nil
+}
+
+type ConfigSignature struct {
+	SignatureHeader []byte `protobuf:"bytes,1,opt,name=signature_header,json=signatureHeader,proto3" json:"signature_header,omitempty"`
 	Signature       []byte `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"`
 }
 
-func (m *ConfigurationSignature) Reset()                    { *m = ConfigurationSignature{} }
-func (m *ConfigurationSignature) String() string            { return proto.CompactTextString(m) }
-func (*ConfigurationSignature) ProtoMessage()               {}
-func (*ConfigurationSignature) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{4} }
+func (m *ConfigSignature) Reset()                    { *m = ConfigSignature{} }
+func (m *ConfigSignature) String() string            { return proto.CompactTextString(m) }
+func (*ConfigSignature) ProtoMessage()               {}
+func (*ConfigSignature) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{10} }
 
 func init() {
-	proto.RegisterType((*ConfigurationEnvelope)(nil), "common.ConfigurationEnvelope")
-	proto.RegisterType((*ConfigurationTemplate)(nil), "common.ConfigurationTemplate")
-	proto.RegisterType((*SignedConfigurationItem)(nil), "common.SignedConfigurationItem")
-	proto.RegisterType((*ConfigurationItem)(nil), "common.ConfigurationItem")
-	proto.RegisterType((*ConfigurationSignature)(nil), "common.ConfigurationSignature")
-	proto.RegisterEnum("common.ConfigurationItem_ConfigurationType", ConfigurationItem_ConfigurationType_name, ConfigurationItem_ConfigurationType_value)
+	proto.RegisterType((*ConfigEnvelope)(nil), "common.ConfigEnvelope")
+	proto.RegisterType((*ConfigGroupSchema)(nil), "common.ConfigGroupSchema")
+	proto.RegisterType((*ConfigValueSchema)(nil), "common.ConfigValueSchema")
+	proto.RegisterType((*ConfigPolicySchema)(nil), "common.ConfigPolicySchema")
+	proto.RegisterType((*Config)(nil), "common.Config")
+	proto.RegisterType((*ConfigUpdateEnvelope)(nil), "common.ConfigUpdateEnvelope")
+	proto.RegisterType((*ConfigUpdate)(nil), "common.ConfigUpdate")
+	proto.RegisterType((*ConfigGroup)(nil), "common.ConfigGroup")
+	proto.RegisterType((*ConfigValue)(nil), "common.ConfigValue")
+	proto.RegisterType((*ConfigPolicy)(nil), "common.ConfigPolicy")
+	proto.RegisterType((*ConfigSignature)(nil), "common.ConfigSignature")
 }
 
 func init() { proto.RegisterFile("common/configtx.proto", fileDescriptor1) }
 
 var fileDescriptor1 = []byte{
-	// 418 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0x74, 0x53, 0xdd, 0x8e, 0xd2, 0x40,
-	0x14, 0xb6, 0xb4, 0x74, 0xe5, 0x40, 0xb4, 0x9e, 0x75, 0x75, 0x34, 0x46, 0x9b, 0x5e, 0x35, 0x41,
-	0x69, 0x82, 0xf1, 0x56, 0x13, 0x8d, 0xc9, 0xfa, 0xb3, 0x4a, 0x66, 0x37, 0x5e, 0x78, 0xe5, 0xd0,
-	0x1e, 0x60, 0x92, 0xd2, 0x69, 0xa6, 0x83, 0x91, 0x27, 0xf0, 0xd9, 0x7c, 0x2b, 0xd3, 0x29, 0xcb,
-	0x2e, 0x50, 0xae, 0x3a, 0xf3, 0x9d, 0xef, 0xa7, 0xe7, 0x4b, 0x0b, 0x67, 0xa9, 0x5a, 0x2e, 0x55,
-	0x91, 0xa4, 0xaa, 0x98, 0xc9, 0xb9, 0xf9, 0x33, 0x2a, 0xb5, 0x32, 0x0a, 0xfd, 0x06, 0x7e, 0x7a,
-	0xba, 0x1d, 0xd7, 0x8f, 0x66, 0x18, 0x7d, 0x83, 0xb3, 0x0f, 0x96, 0xbe, 0xd2, 0xc2, 0x48, 0x55,
-	0x7c, 0x2c, 0x7e, 0x53, 0xae, 0x4a, 0xc2, 0x37, 0xd0, 0xfd, 0x64, 0x68, 0x59, 0x31, 0x27, 0x74,
-	0xe3, 0xfe, 0xf8, 0xc5, 0x68, 0x23, 0xbb, 0x94, 0xf3, 0x82, 0xb2, 0x1d, 0x4d, 0xcd, 0xe3, 0x0d,
-	0x3b, 0x3a, 0xdf, 0xf3, 0xbb, 0xa2, 0x65, 0x99, 0x0b, 0x43, 0x98, 0xec, 0xfa, 0x3d, 0xb9, 0xf6,
-	0x3b, 0xea, 0xf4, 0xd7, 0x81, 0xc7, 0x47, 0xc2, 0xf0, 0x25, 0x3c, 0x38, 0x00, 0x99, 0x13, 0x3a,
-	0xf1, 0x80, 0x1f, 0x0e, 0xf0, 0x2d, 0x40, 0x6d, 0x24, 0xcc, 0x4a, 0x53, 0xc5, 0x3a, 0x36, 0xff,
-	0x79, 0x6b, 0xfe, 0x96, 0xc6, 0x6f, 0x29, 0xa2, 0x7f, 0x9d, 0x96, 0x38, 0x1c, 0x82, 0x7f, 0x4e,
-	0x22, 0x23, 0x6d, 0x83, 0xfb, 0xe3, 0xd3, 0xad, 0xe3, 0x42, 0xc8, 0xa2, 0x19, 0xf1, 0x0d, 0x05,
-	0xdf, 0x81, 0x77, 0xb5, 0x2e, 0x89, 0x75, 0x42, 0x27, 0xbe, 0x37, 0x1e, 0x1e, 0x5d, 0x7e, 0x17,
-	0xa9, 0x25, 0xdc, 0x0a, 0x31, 0x82, 0xc1, 0x57, 0x51, 0x99, 0x0b, 0x95, 0xc9, 0x99, 0xa4, 0x8c,
-	0xb9, 0xa1, 0x13, 0x7b, 0x7c, 0x07, 0xc3, 0x11, 0x60, 0x73, 0x4e, 0xad, 0x7a, 0xa2, 0x72, 0x99,
-	0xae, 0x99, 0x17, 0x3a, 0x71, 0x8f, 0xb7, 0x4c, 0x30, 0x00, 0xf7, 0x0b, 0xad, 0x59, 0xd7, 0x12,
-	0xea, 0x23, 0x3e, 0x84, 0xee, 0x0f, 0x91, 0xaf, 0x88, 0xf9, 0xb6, 0xcb, 0xe6, 0x12, 0x7d, 0xde,
-	0x5b, 0xdf, 0xbe, 0x10, 0x80, 0xdf, 0xd8, 0x04, 0x77, 0xb0, 0x07, 0x5d, 0xbb, 0x74, 0xe0, 0x60,
-	0x1f, 0x4e, 0xbe, 0xeb, 0x8c, 0x34, 0xe9, 0xa0, 0x83, 0x77, 0xc1, 0x9b, 0x10, 0xe9, 0xc0, 0xc5,
-	0x13, 0x70, 0x2f, 0x2e, 0x27, 0x81, 0x17, 0xfd, 0x82, 0x47, 0xed, 0x8d, 0x63, 0x0c, 0xf7, 0xab,
-	0xeb, 0xcb, 0xad, 0x62, 0x07, 0x7c, 0x1f, 0xc6, 0x67, 0xd0, 0xdb, 0x42, 0xb6, 0xd1, 0x01, 0xbf,
-	0x01, 0xde, 0xbf, 0xfa, 0x39, 0x9c, 0x4b, 0xb3, 0x58, 0x4d, 0xeb, 0x92, 0x93, 0xc5, 0xba, 0x24,
-	0x9d, 0x53, 0x36, 0x27, 0x9d, 0xcc, 0xc4, 0x54, 0xcb, 0x34, 0xb1, 0x1f, 0x7e, 0xb5, 0xf9, 0x0d,
-	0xa6, 0xbe, 0xbd, 0xbe, 0xfe, 0x1f, 0x00, 0x00, 0xff, 0xff, 0xc3, 0xe0, 0x32, 0x62, 0x3d, 0x03,
+	// 674 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0x94, 0x55, 0xdb, 0x6e, 0xd3, 0x40,
+	0x10, 0x55, 0xe2, 0xd6, 0x4d, 0x26, 0xe9, 0x85, 0x6d, 0x10, 0xc6, 0x02, 0x51, 0x0c, 0x94, 0x16,
+	0x24, 0xa7, 0x94, 0x87, 0x56, 0x48, 0x7d, 0xa1, 0xaa, 0x80, 0x97, 0x0a, 0x1c, 0x2e, 0x52, 0x85,
+	0x88, 0x5c, 0x7b, 0xeb, 0x58, 0x75, 0xbc, 0x66, 0xbd, 0x2e, 0xe4, 0x2b, 0xf8, 0x40, 0xfe, 0x80,
+	0xaf, 0x40, 0xde, 0x5d, 0x9b, 0x75, 0xe2, 0x24, 0xe2, 0x29, 0x99, 0x99, 0x73, 0xce, 0xec, 0xce,
+	0xce, 0x91, 0xe1, 0xb6, 0x47, 0xc6, 0x63, 0x12, 0xf7, 0x3d, 0x12, 0x5f, 0x85, 0x01, 0xfb, 0x69,
+	0x27, 0x94, 0x30, 0x82, 0x74, 0x91, 0x36, 0xb7, 0xcb, 0x72, 0xfe, 0x23, 0x8a, 0x66, 0xc1, 0x49,
+	0x48, 0x14, 0x7a, 0x21, 0x4e, 0x45, 0xda, 0xba, 0x86, 0x8d, 0x53, 0xae, 0x72, 0x16, 0xdf, 0xe0,
+	0x88, 0x24, 0x18, 0xed, 0x82, 0x2e, 0x74, 0x8d, 0xc6, 0x4e, 0x63, 0xaf, 0x73, 0xb8, 0x61, 0x4b,
+	0x1d, 0x81, 0x73, 0x64, 0x15, 0xbd, 0x80, 0x4e, 0xe4, 0xa6, 0x6c, 0x98, 0x25, 0xbe, 0xcb, 0xb0,
+	0xd1, 0xe4, 0xe0, 0xad, 0x02, 0x5c, 0xc8, 0x39, 0x90, 0x83, 0x3e, 0x71, 0x8c, 0xf5, 0x5b, 0x83,
+	0x5b, 0x42, 0xe5, 0x0d, 0x25, 0x59, 0x32, 0xf0, 0x46, 0x78, 0xec, 0xa2, 0x13, 0xd0, 0x83, 0x3c,
+	0x4c, 0x8d, 0xc6, 0x8e, 0xb6, 0xd7, 0x39, 0x7c, 0x52, 0x6d, 0xa8, 0x40, 0x6d, 0xfe, 0x3f, 0x3d,
+	0x8b, 0x19, 0x9d, 0x38, 0x92, 0x94, 0xd3, 0x6f, 0xdc, 0x28, 0xc3, 0xa9, 0xd1, 0x5c, 0x46, 0xff,
+	0xcc, 0x71, 0x92, 0x2e, 0x48, 0xe8, 0x14, 0x5a, 0xc5, 0x48, 0x0c, 0x8d, 0x0b, 0x3c, 0x9d, 0x2f,
+	0xf0, 0x5e, 0x22, 0x85, 0x44, 0x49, 0x34, 0x3f, 0x42, 0x47, 0x39, 0x1a, 0xda, 0x02, 0xed, 0x1a,
+	0x4f, 0xf8, 0xfc, 0xda, 0x4e, 0xfe, 0x17, 0xf5, 0x61, 0x95, 0xf7, 0x93, 0x63, 0xba, 0x3b, 0xb7,
+	0x85, 0x23, 0x70, 0xaf, 0x9a, 0xc7, 0x8d, 0x5c, 0x55, 0x39, 0xf1, 0x7f, 0xab, 0x72, 0xee, 0xac,
+	0xea, 0x17, 0x58, 0xaf, 0x5c, 0xa3, 0x46, 0xf7, 0xa0, 0xaa, 0x6b, 0x56, 0x75, 0x39, 0x7b, 0x32,
+	0x23, 0x6c, 0x6d, 0x17, 0x8f, 0xab, 0x34, 0xb6, 0x7a, 0x80, 0x66, 0x59, 0xd6, 0x37, 0xd0, 0x45,
+	0x16, 0x99, 0xd0, 0x4a, 0xf1, 0xf7, 0x0c, 0xc7, 0x1e, 0xe6, 0x27, 0x58, 0x71, 0xca, 0x18, 0x1d,
+	0xc3, 0xba, 0x37, 0x72, 0xe3, 0x18, 0x47, 0x43, 0xfe, 0xd6, 0xf2, 0x38, 0xdb, 0x35, 0xc3, 0x73,
+	0xba, 0x12, 0xc9, 0x23, 0x8b, 0x41, 0x4f, 0x14, 0xc5, 0xe2, 0x95, 0xbb, 0xfd, 0x08, 0xd6, 0xc5,
+	0xf6, 0x16, 0x5b, 0x9b, 0xb7, 0xec, 0x3a, 0x5d, 0x4f, 0x01, 0xa3, 0x23, 0x80, 0x34, 0x0c, 0x62,
+	0x97, 0x65, 0xb4, 0x5c, 0xaa, 0x3b, 0xd5, 0x9e, 0x83, 0xa2, 0xee, 0x28, 0x50, 0xeb, 0x57, 0x03,
+	0xba, 0x6a, 0x5b, 0x74, 0x1f, 0xa0, 0xb8, 0x40, 0xe8, 0xcb, 0x01, 0xb7, 0x65, 0xe6, 0x9d, 0x8f,
+	0x6c, 0x68, 0x51, 0xec, 0xfa, 0xc3, 0x14, 0xb3, 0x45, 0x57, 0x5b, 0xcb, 0x41, 0x03, 0xcc, 0xd0,
+	0x01, 0xb4, 0x7f, 0xd0, 0x90, 0x61, 0x4e, 0xd0, 0xe6, 0x13, 0x5a, 0x1c, 0x35, 0xc0, 0xcc, 0xfa,
+	0xa3, 0x41, 0x47, 0xa9, 0x20, 0x03, 0xd6, 0x6e, 0x30, 0x4d, 0x43, 0x12, 0xcb, 0x61, 0x17, 0x21,
+	0x3a, 0x2a, 0x4d, 0x28, 0x2e, 0xfc, 0xa0, 0x46, 0xb8, 0xd6, 0x7e, 0x47, 0xa5, 0xfd, 0xb4, 0xf9,
+	0xc4, 0x3a, 0xe3, 0x9d, 0x28, 0xc6, 0x5b, 0xe1, 0xd4, 0x87, 0x75, 0xd4, 0x39, 0x96, 0xcb, 0x67,
+	0x3b, 0x26, 0xfe, 0x90, 0xc7, 0x13, 0x63, 0x55, 0xcc, 0x76, 0x4c, 0x7c, 0xb1, 0x67, 0xe6, 0xf9,
+	0x32, 0x47, 0xee, 0x57, 0x77, 0xbc, 0x76, 0x90, 0x8a, 0x6b, 0xce, 0x97, 0x79, 0x71, 0xb1, 0x1e,
+	0xe7, 0xaa, 0x7a, 0x1f, 0x96, 0xbb, 0xf0, 0x59, 0x55, 0xb1, 0x57, 0xe7, 0x42, 0xd5, 0x7f, 0x5f,
+	0x8b, 0xb7, 0xe6, 0xcd, 0x16, 0xbc, 0x75, 0x4f, 0x15, 0xee, 0x4a, 0x89, 0xa9, 0x81, 0x6a, 0x53,
+	0x03, 0xb5, 0x48, 0xb1, 0xdb, 0x22, 0x5e, 0x20, 0xbf, 0x0b, 0xba, 0x14, 0x69, 0x56, 0x3f, 0x20,
+	0xf2, 0xc8, 0xb2, 0xba, 0xac, 0xe1, 0x05, 0x6c, 0x4e, 0x99, 0x0d, 0xed, 0xc3, 0x56, 0x69, 0xb7,
+	0xe1, 0x08, 0xbb, 0x3e, 0xa6, 0xd2, 0xc1, 0x9b, 0x65, 0xfe, 0x2d, 0x4f, 0xa3, 0x7b, 0xd0, 0x2e,
+	0x53, 0xf2, 0x9e, 0xff, 0x12, 0xaf, 0x07, 0xf0, 0x98, 0xd0, 0xc0, 0x1e, 0x4d, 0x12, 0x4c, 0x23,
+	0xec, 0x07, 0x98, 0xda, 0x57, 0xee, 0x25, 0x0d, 0x3d, 0xf1, 0x55, 0x4c, 0xe5, 0x89, 0x2f, 0x9e,
+	0x07, 0x21, 0x1b, 0x65, 0x97, 0x79, 0xd8, 0x57, 0xc0, 0x7d, 0x01, 0xee, 0x0b, 0xb0, 0xfc, 0xce,
+	0x5e, 0xea, 0x3c, 0x7c, 0xf9, 0x37, 0x00, 0x00, 0xff, 0xff, 0x25, 0x75, 0xfb, 0xf8, 0x9e, 0x07,
 	0x00, 0x00,
 }

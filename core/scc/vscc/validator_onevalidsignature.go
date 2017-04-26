@@ -19,16 +19,18 @@ package vscc
 import (
 	"fmt"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/common/cauthdsl"
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/chaincode/shim"
+	"github.com/hyperledger/fabric/core/scc/lscc"
 	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
 	"github.com/hyperledger/fabric/protos/common"
 	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protos/utils"
-	"github.com/op/go-logging"
 )
 
-var logger = logging.MustGetLogger("vscc")
+var logger = flogging.MustGetLogger("vscc")
 
 // ValidatorOneValidSignature implements the default transaction validation policy,
 // which is to check the correctness of the read-write set and the endorsement
@@ -69,7 +71,7 @@ func (vscc *ValidatorOneValidSignature) Invoke(stub shim.ChaincodeStubInterface)
 		return shim.Error("No policy supplied")
 	}
 
-	logger.Infof("VSCC invoked")
+	logger.Debugf("VSCC invoked")
 
 	// get the envelope...
 	env, err := utils.GetEnvelopeFromBlock(args[1])
@@ -85,19 +87,24 @@ func (vscc *ValidatorOneValidSignature) Invoke(stub shim.ChaincodeStubInterface)
 		return shim.Error(err.Error())
 	}
 
+	chdr, err := utils.UnmarshalChannelHeader(payl.Header.ChannelHeader)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
 	// get the policy
-	mgr := mspmgmt.GetManagerForChain(payl.Header.ChainHeader.ChainID)
+	mgr := mspmgmt.GetManagerForChain(chdr.ChannelId)
 	pProvider := cauthdsl.NewPolicyProvider(mgr)
-	policy, err := pProvider.NewPolicy(args[2])
+	policy, _, err := pProvider.NewPolicy(args[2])
 	if err != nil {
 		logger.Errorf("VSCC error: pProvider.NewPolicy failed, err %s", err)
 		return shim.Error(err.Error())
 	}
 
 	// validate the payload type
-	if common.HeaderType(payl.Header.ChainHeader.Type) != common.HeaderType_ENDORSER_TRANSACTION {
-		logger.Errorf("Only Endorser Transactions are supported, provided type %d", payl.Header.ChainHeader.Type)
-		return shim.Error(fmt.Sprintf("Only Endorser Transactions are supported, provided type %d", payl.Header.ChainHeader.Type))
+	if common.HeaderType(chdr.Type) != common.HeaderType_ENDORSER_TRANSACTION {
+		logger.Errorf("Only Endorser Transactions are supported, provided type %d", chdr.Type)
+		return shim.Error(fmt.Sprintf("Only Endorser Transactions are supported, provided type %d", chdr.Type))
 	}
 
 	// ...and the transaction...
@@ -137,9 +144,66 @@ func (vscc *ValidatorOneValidSignature) Invoke(stub shim.ChaincodeStubInterface)
 		if err != nil {
 			return shim.Error(fmt.Sprintf("VSCC error: policy evaluation failed, err %s", err))
 		}
+
+		hdrExt, err := utils.GetChaincodeHeaderExtension(payl.Header)
+		if err != nil {
+			logger.Errorf("VSCC error: GetChaincodeHeaderExtension failed, err %s", err)
+			return shim.Error(err.Error())
+		}
+
+		// do some extra validation that is specific to lscc
+		if hdrExt.ChaincodeId.Name == "lscc" {
+			err = vscc.ValidateLSCCInvocation(cap)
+			if err != nil {
+				logger.Errorf("VSCC error: ValidateLSCCInvocation failed, err %s", err)
+				return shim.Error(err.Error())
+			}
+		}
 	}
 
-	logger.Infof("VSCC exists successfully")
+	logger.Debugf("VSCC exists successfully")
 
 	return shim.Success(nil)
+}
+
+func (vscc *ValidatorOneValidSignature) ValidateLSCCInvocation(cap *pb.ChaincodeActionPayload) error {
+	cpp, err := utils.GetChaincodeProposalPayload(cap.ChaincodeProposalPayload)
+	if err != nil {
+		logger.Errorf("VSCC error: GetChaincodeProposalPayload failed, err %s", err)
+		return err
+	}
+
+	cis := &pb.ChaincodeInvocationSpec{}
+	err = proto.Unmarshal(cpp.Input, cis)
+	if err != nil {
+		logger.Errorf("VSCC error: Unmarshal ChaincodeInvocationSpec failed, err %s", err)
+		return err
+	}
+
+	if cis == nil ||
+		cis.ChaincodeSpec == nil ||
+		cis.ChaincodeSpec.Input == nil ||
+		cis.ChaincodeSpec.Input.Args == nil {
+		logger.Errorf("VSCC error: committing invalid vscc invocation")
+		return fmt.Errorf("VSCC error: committing invalid vscc invocation")
+	}
+
+	lsccFunc := string(cis.ChaincodeSpec.Input.Args[0])
+	lsccArgs := cis.ChaincodeSpec.Input.Args[1:]
+
+	switch lsccFunc {
+	case lscc.DEPLOY:
+	case lscc.UPGRADE:
+		logger.Infof("VSCC info: validating invocation of lscc function %s on arguments %#v", lsccFunc, lsccArgs)
+
+		// TODO: two more crs are expected to fill this gap, as explained in FAB-3155
+		// 1) check that the invocation complies with the InstantiationPolicy
+		// 2) check that the read/write set is appropriate
+
+		return nil
+	default:
+		return fmt.Errorf("VSCC error: committing an invocation of function %s of lscc is invalid", lsccFunc)
+	}
+
+	return nil
 }

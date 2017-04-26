@@ -17,11 +17,41 @@ limitations under the License.
 package mgmt
 
 import (
+	"reflect"
 	"sync"
 
+	"errors"
+
+	"github.com/hyperledger/fabric/bccsp/factory"
+	configvaluesmsp "github.com/hyperledger/fabric/common/config/msp"
+	"github.com/hyperledger/fabric/common/flogging"
+	"github.com/hyperledger/fabric/core/config"
 	"github.com/hyperledger/fabric/msp"
-	"github.com/op/go-logging"
 )
+
+// LoadLocalMsp loads the local MSP from the specified directory
+func LoadLocalMsp(dir string, bccspConfig *factory.FactoryOpts, mspID string) error {
+	if mspID == "" {
+		return errors.New("The local MSP must have an ID")
+	}
+
+	conf, err := msp.GetLocalMspConfig(dir, bccspConfig, mspID)
+	if err != nil {
+		return err
+	}
+
+	return GetLocalMSP().Setup(conf)
+}
+
+// Loads the development local MSP for use in testing.  Not valid for production/runtime context
+func LoadDevMsp() error {
+	mspDir, err := config.GetDevMspDir()
+	if err != nil {
+		return err
+	}
+
+	return LoadLocalMsp(mspDir, nil, "DEFAULT")
+}
 
 // FIXME: AS SOON AS THE CHAIN MANAGEMENT CODE IS COMPLETE,
 // THESE MAPS AND HELPSER FUNCTIONS SHOULD DISAPPEAR BECAUSE
@@ -31,40 +61,50 @@ import (
 var m sync.Mutex
 var localMsp msp.MSP
 var mspMap map[string]msp.MSPManager = make(map[string]msp.MSPManager)
-var mspLogger = logging.MustGetLogger("msp")
+var mspLogger = flogging.MustGetLogger("msp")
 
 // GetManagerForChain returns the msp manager for the supplied
 // chain; if no such manager exists, one is created
-func GetManagerForChain(ChainID string) msp.MSPManager {
-	var mspMgr msp.MSPManager
-	var created bool = false
-	{
-		m.Lock()
-		defer m.Unlock()
+func GetManagerForChain(chainID string) msp.MSPManager {
+	m.Lock()
+	defer m.Unlock()
 
-		mspMgr = mspMap[ChainID]
-		if mspMgr == nil {
-			created = true
-			mspMgr = msp.NewMSPManager()
-			mspMap[ChainID] = mspMgr
-		}
-	}
-
-	if created {
-		mspLogger.Debugf("Created new msp manager for chain %s", ChainID)
+	mspMgr, ok := mspMap[chainID]
+	if !ok {
+		mspLogger.Debugf("Created new msp manager for chain %s", chainID)
+		mspMgr = msp.NewMSPManager()
+		mspMap[chainID] = mspMgr
 	} else {
-		mspLogger.Debugf("Returning existing manager for chain %s", ChainID)
+		switch mgr := mspMgr.(type) {
+		case *configvaluesmsp.MSPConfigHandler:
+			// check for nil MSPManager interface as it can exist but not be
+			// instantiated
+			if mgr.MSPManager == nil {
+				mspLogger.Debugf("MSPManager is not instantiated; no MSPs are defined for this channel.")
+				// return nil so the MSPManager methods cannot be accidentally called,
+				// which would result in a panic
+				return nil
+			}
+		default:
+			// check for internal mspManagerImpl type. if a different type is found,
+			// it's because a developer has added a new type that implements the
+			// MSPManager interface and should add a case to the logic above to handle
+			// it.
+			if reflect.TypeOf(mgr).Elem().Name() != "mspManagerImpl" {
+				panic("Found unexpected MSPManager type.")
+			}
+		}
+		mspLogger.Debugf("Returning existing manager for channel '%s'", chainID)
 	}
-
 	return mspMgr
 }
 
 // GetManagers returns all the managers registered
-func GetManagers() map[string]msp.MSPManager {
+func GetDeserializers() map[string]msp.IdentityDeserializer {
 	m.Lock()
 	defer m.Unlock()
 
-	clone := make(map[string]msp.MSPManager)
+	clone := make(map[string]msp.IdentityDeserializer)
 
 	for key, mspManager := range mspMap {
 		clone[key] = mspManager
@@ -80,6 +120,16 @@ func GetManagerForChainIfExists(ChainID string) msp.MSPManager {
 	defer m.Unlock()
 
 	return mspMap[ChainID]
+}
+
+// XXXSetMSPManager is a stopgap solution to transition from the custom MSP config block
+// parsing to the configtx.Manager interface, while preserving the problematic singleton
+// nature of the MSP manager
+func XXXSetMSPManager(chainID string, manager msp.MSPManager) {
+	m.Lock()
+	defer m.Unlock()
+
+	mspMap[chainID] = manager
 }
 
 // GetLocalMSP returns the local msp (and creates it if it doesn't exist)
@@ -111,8 +161,8 @@ func GetLocalMSP() msp.MSP {
 	return lclMsp
 }
 
-//GetMSPCommon returns the common interface
-func GetMSPCommon(chainID string) msp.Common {
+// GetIdentityDeserializer returns the IdentityDeserializer for the given chain
+func GetIdentityDeserializer(chainID string) msp.IdentityDeserializer {
 	if chainID == "" {
 		return GetLocalMSP()
 	}

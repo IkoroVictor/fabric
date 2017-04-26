@@ -20,26 +20,99 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/hyperledger/fabric/common/ledger/testutil"
 	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
-	"github.com/hyperledger/fabric/core/ledger/testutil"
 )
 
 //Unit test of couch db util functionality
 func TestCreateCouchDBConnectionAndDB(t *testing.T) {
+	if ledgerconfig.IsCouchDBEnabled() {
 
-	//call a helper method to load the core.yaml
-	testutil.SetupCoreYAMLConfig("./../../../../peer")
-
-	if ledgerconfig.IsCouchDBEnabled() == true {
-
-		cleanup()
-		defer cleanup()
+		database := "testcreatecouchdbconnectionanddb"
+		cleanup(database)
+		defer cleanup(database)
 		//create a new connection
-		couchInstance, err := CreateCouchInstance(connectURL, "", "")
+		couchInstance, err := CreateCouchInstance(couchDBDef.URL, couchDBDef.Username, couchDBDef.Password,
+			couchDBDef.MaxRetries, couchDBDef.MaxRetriesOnStartup, couchDBDef.RequestTimeout)
 		testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to CreateCouchInstance"))
 
 		_, err = CreateCouchDatabase(*couchInstance, database)
 		testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to CreateCouchDatabase"))
 	}
+
+}
+
+//Unit test of couch db util functionality
+func TestCreateCouchDBSystemDBs(t *testing.T) {
+	if ledgerconfig.IsCouchDBEnabled() {
+
+		database := "testcreatecouchdbsystemdb"
+		cleanup(database)
+		defer cleanup(database)
+
+		//create a new connection
+		couchInstance, err := CreateCouchInstance(couchDBDef.URL, couchDBDef.Username, couchDBDef.Password,
+			couchDBDef.MaxRetries, couchDBDef.MaxRetriesOnStartup, couchDBDef.RequestTimeout)
+
+		testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to CreateCouchInstance"))
+
+		err = CreateSystemDatabasesIfNotExist(*couchInstance)
+		testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to create system databases"))
+
+		db := CouchDatabase{CouchInstance: *couchInstance, DBName: "_users"}
+
+		//Retrieve the info for the new database and make sure the name matches
+		dbResp, _, errdb := db.GetDatabaseInfo()
+		testutil.AssertNoError(t, errdb, fmt.Sprintf("Error when trying to retrieve _users database information"))
+		testutil.AssertEquals(t, dbResp.DbName, "_users")
+
+		db = CouchDatabase{CouchInstance: *couchInstance, DBName: "_replicator"}
+
+		//Retrieve the info for the new database and make sure the name matches
+		dbResp, _, errdb = db.GetDatabaseInfo()
+		testutil.AssertNoError(t, errdb, fmt.Sprintf("Error when trying to retrieve _replicator database information"))
+		testutil.AssertEquals(t, dbResp.DbName, "_replicator")
+
+		db = CouchDatabase{CouchInstance: *couchInstance, DBName: "_global_changes"}
+
+		//Retrieve the info for the new database and make sure the name matches
+		dbResp, _, errdb = db.GetDatabaseInfo()
+		testutil.AssertNoError(t, errdb, fmt.Sprintf("Error when trying to retrieve _global_changes database information"))
+		testutil.AssertEquals(t, dbResp.DbName, "_global_changes")
+
+	}
+
+}
+func TestDatabaseMapping(t *testing.T) {
+
+	//create a new instance and database object using a database name mixed case
+	databaseName, err := mapAndValidateDatabaseName("testDB")
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to map database name"))
+	testutil.AssertEquals(t, databaseName, "testdb")
+
+	//create a new instance and database object using a database name with numerics
+	databaseName, err = mapAndValidateDatabaseName("test1234DB")
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to map database name"))
+	testutil.AssertEquals(t, databaseName, "test1234db")
+
+	//create a new instance and database object using a database name with special characters
+	databaseName, err = mapAndValidateDatabaseName("test1234_$(),+-/~!@#%^&*[]{}.")
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to map database name"))
+	testutil.AssertEquals(t, databaseName, "test1234_$(),+-/_____________")
+
+	//create a new instance and database object using a database name with special characters
+	databaseName, err = mapAndValidateDatabaseName("5test1234")
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to map database name"))
+	testutil.AssertEquals(t, databaseName, "db_5test1234")
+
+	//create a new instance and database object using an empty string
+	_, err = mapAndValidateDatabaseName("")
+	testutil.AssertError(t, err, fmt.Sprintf("Error should have been thrown for an invalid name"))
+
+	_, err = mapAndValidateDatabaseName("A12345678901234567890123456789012345678901234" +
+		"56789012345678901234567890123456789012345678901234567890123456789012345678901234567890" +
+		"12345678901234567890123456789012345678901234567890123456789012345678901234567890123456" +
+		"78901234567890123456789012345678901234567890")
+	testutil.AssertError(t, err, fmt.Sprintf("Error should have been thrown for an invalid name"))
 
 }

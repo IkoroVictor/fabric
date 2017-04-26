@@ -17,8 +17,8 @@ package example;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.hyperledger.java.shim.ChaincodeBase;
-import org.hyperledger.java.shim.ChaincodeStub;
+import org.hyperledger.fabric.shim.ChaincodeBase;
+import org.hyperledger.fabric.shim.ChaincodeStub;
 
 import java.util.Map;
 
@@ -57,9 +57,9 @@ public class RangeExample extends ChaincodeBase {
             case "keys":{
                 Map<String, String> keysIter = null;
                 if (args.length >= 2) {
-                    keysIter = stub.rangeQueryState(args[0], args[1]);
+                    keysIter = stub.getStateByRange(args[0], args[1]);
                 }else{
-                    keysIter = stub.rangeQueryState("","");
+                    keysIter = stub.getStateByRange("","");
                 }
 
                 return keysIter.keySet().toString();

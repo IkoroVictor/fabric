@@ -31,10 +31,13 @@ package peer
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net"
 
 	"github.com/spf13/viper"
 
+	"github.com/hyperledger/fabric/core/comm"
+	"github.com/hyperledger/fabric/core/config"
 	pb "github.com/hyperledger/fabric/protos/peer"
 )
 
@@ -52,7 +55,6 @@ var peerEndpointError error
 var syncStateSnapshotChannelSize int
 var syncStateDeltasChannelSize int
 var syncBlocksChannelSize int
-var validatorEnabled bool
 
 // Note: There is some kind of circular import issue that prevents us from
 // importing the "core" package into the "peer" package. The
@@ -89,7 +91,7 @@ func CacheConfiguration() (err error) {
 		if err != nil {
 			return nil, err
 		}
-		return &pb.PeerEndpoint{ID: &pb.PeerID{Name: viper.GetString("peer.id")}, Address: peerAddress}, nil
+		return &pb.PeerEndpoint{Id: &pb.PeerID{Name: viper.GetString("peer.id")}, Address: peerAddress}, nil
 	}
 
 	localAddress, localAddressError = getLocalAddress()
@@ -98,7 +100,6 @@ func CacheConfiguration() (err error) {
 	syncStateSnapshotChannelSize = viper.GetInt("peer.sync.state.snapshot.channelSize")
 	syncStateDeltasChannelSize = viper.GetInt("peer.sync.state.deltas.channelSize")
 	syncBlocksChannelSize = viper.GetInt("peer.sync.blocks.channelSize")
-	validatorEnabled = viper.GetBool("peer.validator.enabled")
 
 	securityEnabled = true
 
@@ -161,18 +162,38 @@ func SyncBlocksChannelSize() int {
 	return syncBlocksChannelSize
 }
 
-// ValidatorEnabled returns the peer.validator.enabled property
-func ValidatorEnabled() bool {
-	if !configurationCached {
-		cacheConfiguration()
-	}
-	return validatorEnabled
-}
-
 // SecurityEnabled returns the securityEnabled property from cached configuration
 func SecurityEnabled() bool {
 	if !configurationCached {
 		cacheConfiguration()
 	}
 	return securityEnabled
+}
+
+// GetSecureConfig returns the secure server configuration for the peer
+func GetSecureConfig() (comm.SecureServerConfig, error) {
+	secureConfig := comm.SecureServerConfig{
+		UseTLS: viper.GetBool("peer.tls.enabled"),
+	}
+	if secureConfig.UseTLS {
+		// get the certs from the file system
+		serverKey, err := ioutil.ReadFile(config.GetPath("peer.tls.key.file"))
+		serverCert, err := ioutil.ReadFile(config.GetPath("peer.tls.cert.file"))
+		// must have both key and cert file
+		if err != nil {
+			return secureConfig, fmt.Errorf("Error loading TLS key and/or certificate (%s)", err)
+		}
+		secureConfig.ServerCertificate = serverCert
+		secureConfig.ServerKey = serverKey
+		// check for root cert
+		if config.GetPath("peer.tls.rootcert.file") != "" {
+			rootCert, err := ioutil.ReadFile(config.GetPath("peer.tls.rootcert.file"))
+			if err != nil {
+				return secureConfig, fmt.Errorf("Error loading TLS root certificate (%s)", err)
+			}
+			secureConfig.ServerRootCAs = [][]byte{rootCert}
+		}
+		return secureConfig, nil
+	}
+	return secureConfig, nil
 }

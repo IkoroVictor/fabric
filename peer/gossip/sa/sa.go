@@ -17,12 +17,12 @@ limitations under the License.
 package sa
 
 import (
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/msp/mgmt"
-	"github.com/op/go-logging"
 )
 
-var logger = logging.MustGetLogger("peer/gossip/sa")
+var logger = flogging.MustGetLogger("peer/gossip/sa")
 
 // mspSecurityAdvisor implements the SecurityAdvisor interface
 // using peer's MSPs.
@@ -65,14 +65,12 @@ func (advisor *mspSecurityAdvisor) OrgByPeerIdentity(peerIdentity api.PeerIdenti
 
 	// First check against the local MSP.
 	identity, err := mgmt.GetLocalMSP().DeserializeIdentity([]byte(peerIdentity))
-	if err != nil {
-		logger.Warning("LocalMSP failed deserializing peer identity [%s]", err)
-	} else {
+	if err == nil {
 		return []byte(identity.GetMSPIdentifier())
 	}
 
 	// Check against managers
-	for chainID, mspManager := range mgmt.GetManagers() {
+	for chainID, mspManager := range mgmt.GetDeserializers() {
 		// Deserialize identity
 		identity, err := mspManager.DeserializeIdentity([]byte(peerIdentity))
 		if err != nil {

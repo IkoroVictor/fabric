@@ -36,18 +36,18 @@ import (
 
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/bccsp/utils"
-	"github.com/op/go-logging"
+	"github.com/hyperledger/fabric/common/flogging"
 	"golang.org/x/crypto/sha3"
 )
 
 var (
-	logger = logging.MustGetLogger("SW_BCCSP")
+	logger = flogging.MustGetLogger("bccsp_sw")
 )
 
 // NewDefaultSecurityLevel returns a new instance of the software-based BCCSP
 // at security level 256, hash family SHA2 and using FolderBasedKeyStore as KeyStore.
 func NewDefaultSecurityLevel(keyStorePath string) (bccsp.BCCSP, error) {
-	ks := &FileBasedKeyStore{}
+	ks := &fileBasedKeyStore{}
 	if err := ks.Init(nil, keyStorePath, false); err != nil {
 		return nil, fmt.Errorf("Failed initializing key store [%s]", err)
 	}

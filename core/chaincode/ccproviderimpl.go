@@ -67,27 +67,27 @@ func (c *ccProviderImpl) GetContext(ledger ledger.PeerLedger) (context.Context, 
 // GetCCContext returns an interface that encapsulates a
 // chaincode context; the interface is required to avoid
 // referencing the chaincode package from the interface definition
-func (c *ccProviderImpl) GetCCContext(cid, name, version, txid string, syscc bool, prop *pb.Proposal) interface{} {
-	ctx := ccprovider.NewCCContext(cid, name, version, txid, syscc, prop)
+func (c *ccProviderImpl) GetCCContext(cid, name, version, txid string, syscc bool, signedProp *pb.SignedProposal, prop *pb.Proposal) interface{} {
+	ctx := ccprovider.NewCCContext(cid, name, version, txid, syscc, signedProp, prop)
 	return &ccProviderContextImpl{ctx: ctx}
 }
 
-// GetCCValidationInfoFromLCCC returns the VSCC and the policy listed in LCCC for the supplied chaincode
-func (c *ccProviderImpl) GetCCValidationInfoFromLCCC(ctxt context.Context, txid string, prop *pb.Proposal, chainID string, chaincodeID string) (string, []byte, error) {
-	// LCCC does not have any notion about its own
+// GetCCValidationInfoFromLSCC returns the VSCC and the policy listed in LSCC for the supplied chaincode
+func (c *ccProviderImpl) GetCCValidationInfoFromLSCC(ctxt context.Context, txid string, signedProp *pb.SignedProposal, prop *pb.Proposal, chainID string, chaincodeID string) (string, []byte, error) {
+	// LSCC does not have any notion about its own
 	// endorsing policy - we should never call this
-	// function with lccc as the chaincodeID
-	if chaincodeID == "lccc" {
-		panic("GetCCValidationInfoFromLCCC invoke for LCCC")
+	// function with lscc as the chaincodeID
+	if chaincodeID == "lscc" {
+		panic("GetCCValidationInfoFromLSCC invoke for LSCC")
 	}
 
-	data, err := GetChaincodeDataFromLCCC(ctxt, txid, prop, chainID, chaincodeID)
+	data, err := GetChaincodeDataFromLSCC(ctxt, txid, signedProp, prop, chainID, chaincodeID)
 	if err != nil {
 		return "", nil, err
 	}
 
 	if data == nil || data.Vscc == "" || data.Policy == nil {
-		return "", nil, fmt.Errorf("Incorrect validation info in LCCC")
+		return "", nil, fmt.Errorf("Incorrect validation info in LSCC")
 	}
 
 	return data.Vscc, data.Policy, nil
